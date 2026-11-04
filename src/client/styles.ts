@@ -1,6 +1,6 @@
 export const styles = `
 .dmr-user-row { position: relative; }
-.dmr-user-actions { display: flex; justify-content: flex-end; margin-top: 2px; opacity: 0; transition: opacity .15s ease; }
+.dmr-user-actions { display: flex; justify-content: flex-end; gap: 2px; margin-top: 2px; opacity: 0; transition: opacity .15s ease; }
 .dmr-user-row:hover .dmr-user-actions, .dmr-user-actions:focus-within, .dmr-user-actions[data-open] { opacity: 1; }
 @media (hover: none) { .dmr-user-actions { opacity: 1; } }
 .dmr-anchor { position: relative; display: inline-flex; }
@@ -23,4 +23,9 @@ export const styles = `
   background: transparent; color: inherit; font: inherit; cursor: pointer; }
 .dmr-button[data-primary] { background: var(--dsw-alias-interactive-primary, #4d6bfe); border-color: transparent; color: #fff; }
 .dmr-button:disabled { opacity: .6; cursor: default; }
+.dmr-panel .dmr-note { font-size: 12px; color: var(--dsw-alias-label-tertiary, inherit); }
+.dmr-armed { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; padding: 8px 12px;
+  border: 1px dashed var(--dsw-alias-border-secondary, rgba(127,127,127,.35)); border-radius: var(--dsw-radius-md, 10px);
+  color: var(--dsw-alias-label-secondary, inherit); font-size: 13px; line-height: 1.5; }
+.dmr-armed [data-tone="error"] { color: var(--dsw-alias-label-danger, #c62828); }
 `

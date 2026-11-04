@@ -1,7 +1,8 @@
-# One root row beside the built-in workspace-changes recorder: it observes
-# every top-level Session's human messages, gates tool execution on their
-# checkpoints, and serves the rewind Remote. Settings live in this row's
-# config and apply when the row is restarted from the Plugins page.
+# One root row beside the built-in workspace-changes recorder: it serves the
+# rewind Remote and, on the step that admits an edited or regenerated
+# message, shadows the withdrawn exchange on the model-visible surface.
+# Settings live in this row's config and apply when the row is restarted
+# from the Plugins page.
 - insert:
     - id: message-rewind
       name: dsh-message-rewind

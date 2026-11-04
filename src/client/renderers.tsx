@@ -1,6 +1,7 @@
 /** Chat renderers: the user-message shadow and the retry action. */
-import { useSyncExternalStore } from 'react'
-import { RewindButton, UserRewindActions, retryTarget, type RewindFace } from './components.js'
+import { useEffect, useSyncExternalStore } from 'react'
+import { ArmedNotice, RewindButton, UserRewindActions, retryTarget, type RewindFace } from './components.js'
+import type { FeedRegistry, SessionFeed } from './feed.js'
 
 export const NODE_SLOT = 'conversation.chat.node'
 
@@ -30,7 +31,21 @@ export function officialRenderer(slots: Pick<SlotsLike, 'entries'>, key: string,
   return chosen?.component as ((props: any) => any) | undefined
 }
 
-export function createUserNodeRenderer(slots: Pick<SlotsLike, 'entries' | 'subscribe'>, face: RewindFace) {
+const noFeed = { subscribe: () => () => {}, getRevision: () => 0 }
+
+/** Hold this Session's feed while the row is mounted and re-render when its ranges change. */
+function useFeed(feeds: FeedRegistry | undefined, sessionId: string | undefined): SessionFeed | undefined {
+  const feed = sessionId === undefined ? undefined : feeds?.ensure(sessionId)
+  useEffect(() => {
+    if (sessionId === undefined || feeds === undefined) return
+    feeds.acquire(sessionId)
+    return () => feeds.release(sessionId)
+  }, [feeds, sessionId])
+  useSyncExternalStore(feed?.subscribe ?? noFeed.subscribe, feed?.getRevision ?? noFeed.getRevision)
+  return feed
+}
+
+export function createUserNodeRenderer(slots: Pick<SlotsLike, 'entries' | 'subscribe'>, face: RewindFace, feeds?: FeedRegistry) {
   function RewindableUserNode(props: any) {
     const kind: string = props.node?.kind ?? 'user'
     const Official = useSyncExternalStore(
@@ -38,11 +53,17 @@ export function createUserNodeRenderer(slots: Pick<SlotsLike, 'entries' | 'subsc
       () => officialRenderer(slots, kind, RewindableUserNode),
     )
     const subagent = props.useSession?.((state: { subagent?: unknown }) => state.subagent != null) ?? false
+    const sessionId: string | undefined = typeof props.sessionId === 'string' ? props.sessionId : undefined
+    const feed = useFeed(subagent ? undefined : feeds, sessionId)
     const seq = props.node?.data?.seq
+    if (typeof seq === 'number' && sessionId !== undefined && feed) {
+      if (feed.armedSeq() === seq) return <div className="dmr-user-row" data-message-rewind-seq={seq}><ArmedNotice sessionId={sessionId} face={face} /></div>
+      if (feed.isHidden(seq)) return null
+    }
     return <div className="dmr-user-row" data-message-rewind-seq={seq}>
       {Official ? <Official {...props} /> : null}
-      {!subagent && typeof seq === 'number' && typeof props.sessionId === 'string'
-        ? <UserRewindActions sessionId={props.sessionId} seq={seq} face={face} />
+      {!subagent && typeof seq === 'number' && sessionId !== undefined
+        ? <UserRewindActions sessionId={sessionId} seq={seq} face={face} />
         : null}
     </div>
   }

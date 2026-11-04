@@ -7,6 +7,7 @@ const seq = z.number().int().nonnegative()
 
 export const targetSchema = z.object({ sessionId, seq }).strict()
 export type RewindTarget = z.infer<typeof targetSchema>
+export const sessionSchema = z.object({ sessionId }).strict()
 
 const attachmentSchema = z.object({
   kind: z.enum(['image', 'file']),
@@ -18,29 +19,26 @@ const attachmentSchema = z.object({
 })
 export type RewindAttachmentInfo = z.infer<typeof attachmentSchema>
 
-const checkpointSchema = z.object({
-  createdAt: z.number(),
-  files: z.number().int().nonnegative(),
-  skipped: z.number().int().nonnegative(),
-  truncated: z.boolean(),
-  /** Session whose recording holds the checkpoint (a fork source for inherited messages). */
-  ownerSessionId: z.string(),
+/** Workspace edits recorded after the target message; rewinding does not undo them. */
+const modifiedSchema = z.object({
+  /** Turns the built-in recorder reported changed files for (`workspace/changes`). */
+  turns: z.number().int().nonnegative(),
+  /** Calls of file-editing tools (`write`, `edit`, ...). */
+  edits: z.number().int().nonnegative(),
 })
+export type RewindModified = z.infer<typeof modifiedSchema>
 
 export const inspectionSchema = z.object({
   sessionId: z.string(),
   seq,
-  /** Inclusive fork boundary; null when a fresh Session replaces the fork. */
-  boundary: z.number().int().nonnegative().nullable(),
-  /** Queued messages the fork would inherit and the rewind removes. */
-  inheritedQueue: z.array(z.string()),
+  /** Why the message cannot be rewound; null when it can. */
+  refusal: z.enum(['missing', 'head', 'not-user']).nullable(),
   text: z.string(),
   attachments: z.array(attachmentSchema),
-  checkpoint: checkpointSchema.nullable(),
-  cwd: z.string().nullable(),
-  agentPreset: z.string().nullable(),
-  /** Host settings the client follows. */
-  settings: z.object({ restoreFiles: z.boolean(), archiveSource: z.boolean() }),
+  modified: modifiedSchema,
+  /** Later human messages the rewind withdraws. */
+  laterMessages: z.number().int().nonnegative(),
+  running: z.boolean(),
 })
 export type RewindInspection = z.infer<typeof inspectionSchema>
 
@@ -48,19 +46,21 @@ export const attachmentRequestSchema = z.object({ sessionId, seq, index: z.numbe
 export const attachmentDataSchema = z.object({ name: z.string(), mediaType: z.string(), data: z.string() })
 export type RewindAttachmentData = z.infer<typeof attachmentDataSchema>
 
-export const restoreResultSchema = z.object({
-  restored: z.boolean(),
-  written: z.number().int().nonnegative(),
-  deleted: z.number().int().nonnegative(),
-  unchanged: z.number().int().nonnegative(),
-  failed: z.array(z.string()),
-  /** Checkpoint of the files just before the restore; `undo` puts them back. */
-  backupId: z.string().nullable(),
-})
-export type RewindRestoreResult = z.infer<typeof restoreResultSchema>
+/** `knownModified`: the person already saw a warning listing workspace edits. */
+export const armSchema = z.object({ sessionId, seq, knownModified: z.boolean() }).strict()
+export const retrySchema = z.object({ sessionId, seq, knownModified: z.boolean(), note: z.string().max(2000).nullable() }).strict()
 
-export const undoSchema = z.object({ sessionId, backupId: z.string().regex(/^backup-[0-9a-z-]+$/) }).strict()
-export const linkSchema = z.object({ childId: sessionId, sourceId: sessionId, boundary: z.number().int().nonnegative().nullable() }).strict()
+/** A pending edit: the next human message replaces `seq` and everything after it, up to `lastSeq` at arming. */
+const armedSchema = z.object({ seq, lastSeq: seq })
+export type RewindArmed = z.infer<typeof armedSchema>
+
+/** Stopping the task surfaced edits the person has not seen; nothing changed. */
+const confirmSchema = z.object({ status: z.literal('confirm'), inspection: inspectionSchema })
+export const armResultSchema = z.union([z.object({ status: z.literal('armed'), armed: armedSchema }), confirmSchema])
+export type RewindArmResult = z.infer<typeof armResultSchema>
+export const retryResultSchema = z.union([z.object({ status: z.literal('sent') }), confirmSchema])
+export type RewindRetryResult = z.infer<typeof retryResultSchema>
+export const stateSchema = z.object({ armed: armedSchema.nullable() })
 const ok = z.object({ ok: z.literal(true) })
 
 const codec = (schema: z.ZodType, typeSymbol: string) => ({ mode: 'strict' as const, typeSymbol, create: () => schema })
@@ -73,9 +73,10 @@ const method = (input: z.ZodType, output: z.ZodType) => ({
 export const remoteInfo = createTypertRemoteInfo({ package: 'dsh-message-rewind', methods: {
   'messageRewind/inspect': method(targetSchema, inspectionSchema),
   'messageRewind/attachment': method(attachmentRequestSchema, attachmentDataSchema),
-  'messageRewind/restore': method(targetSchema, restoreResultSchema),
-  'messageRewind/undo': method(undoSchema, restoreResultSchema),
-  'messageRewind/link': method(linkSchema, ok),
+  'messageRewind/arm': method(armSchema, armResultSchema),
+  'messageRewind/disarm': method(sessionSchema, ok),
+  'messageRewind/retry': method(retrySchema, retryResultSchema),
+  'messageRewind/state': method(sessionSchema, stateSchema),
 } }, z)
 
 async function invoke<T>(remote: unknown, key: string, request: unknown, signal?: AbortSignal): Promise<T> {
@@ -88,17 +89,19 @@ async function invoke<T>(remote: unknown, key: string, request: unknown, signal?
 export interface RewindRemote {
   inspect(target: RewindTarget, signal?: AbortSignal): Promise<RewindInspection>
   attachment(request: RewindTarget & { index: number }, signal?: AbortSignal): Promise<RewindAttachmentData>
-  restore(target: RewindTarget, signal?: AbortSignal): Promise<RewindRestoreResult>
-  undo(request: { sessionId: string; backupId: string }, signal?: AbortSignal): Promise<RewindRestoreResult>
-  link(request: { childId: string; sourceId: string; boundary: number | null }, signal?: AbortSignal): Promise<{ ok: true }>
+  arm(request: RewindTarget & { knownModified: boolean }, signal?: AbortSignal): Promise<RewindArmResult>
+  disarm(request: { sessionId: string }, signal?: AbortSignal): Promise<{ ok: true }>
+  retry(request: RewindTarget & { knownModified: boolean; note: string | null }, signal?: AbortSignal): Promise<RewindRetryResult>
+  state(request: { sessionId: string }, signal?: AbortSignal): Promise<{ armed: RewindArmed | null }>
 }
 
 export function bindRemote(remote: unknown): RewindRemote {
   return {
     inspect: (target, signal) => invoke(remote, 'messageRewind/inspect', target, signal),
     attachment: (request, signal) => invoke(remote, 'messageRewind/attachment', request, signal),
-    restore: (target, signal) => invoke(remote, 'messageRewind/restore', target, signal),
-    undo: (request, signal) => invoke(remote, 'messageRewind/undo', request, signal),
-    link: (request, signal) => invoke(remote, 'messageRewind/link', request, signal),
+    arm: (request, signal) => invoke(remote, 'messageRewind/arm', request, signal),
+    disarm: (request, signal) => invoke(remote, 'messageRewind/disarm', request, signal),
+    retry: (request, signal) => invoke(remote, 'messageRewind/retry', request, signal),
+    state: (request, signal) => invoke(remote, 'messageRewind/state', request, signal),
   }
 }

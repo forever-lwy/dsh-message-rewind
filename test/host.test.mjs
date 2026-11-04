@@ -1,28 +1,16 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, readFile, rm, writeFile, readdir, utimes } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { SessionStore, SessionId } from '@deepseek-ai/dsh-session'
-import { LlmRuntime, createUserMessage } from '@deepseek-ai/dsh-llm'
+import { LlmRuntime, createAssistantMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import * as Plugin from '../lib/index.js'
 
 const signal = new AbortController().signal
+const image = Buffer.from('fake-png-bytes')
+const file = Buffer.from('report body')
 
-// The loader passes (ctx, config) only; the store follows DSH_HOME as in production.
-async function home(prefix) {
-  const base = await mkdtemp(join(tmpdir(), prefix))
-  process.env.DSH_HOME = join(base, 'dsh-home')
-  return base
-}
-const storeOf = base => join(base, 'dsh-home', 'storages', 'dsh-message-rewind')
-
-async function setup() {
-  const base = await home('dmr-host-')
-  const work = join(base, 'work')
-  await mkdir(work)
-  await writeFile(join(work, 'app.js'), 'v1')
+/** A real rc.5 Session behind a minimal Agent and the agent hooks the loop dispatches. */
+async function setup(config = {}) {
   const ctx = new Context()
   const descriptors = []
   ctx.provide('typert', {
@@ -30,128 +18,164 @@ async function setup() {
     contexts: { registerHost: () => () => {} },
     remotes: { register: info => { descriptors.push(info); return () => {} } },
   })
-  const image = Buffer.from('fake-png-bytes')
-  const file = Buffer.from('report body')
   ctx.provide('attachments', {
     readImage: async ref => ({ ref, data: new Uint8Array(image) }),
     readFileStream: async function* () { yield new Uint8Array(file.subarray(0, 4)); yield new Uint8Array(file.subarray(4)) },
   })
+  const agents = new Map()
+  ctx.provide('agents', { get: id => agents.get(id) })
   await ctx.plugin(LlmRuntime)
   await ctx.plugin(SessionStore)
-  const fiber = await ctx.plugin(Plugin, { maxFiles: 1000 })
-  await fiber
-  return { base, work, ctx, descriptors, image, file, fiber }
+  await ctx.plugin(Plugin, config)
+  const session = ctx.sessions.create(SessionId('s1'), { meta: { cwd: '/work' } })
+  const agent = {
+    id: 's1', session, status: 'idle', sent: [], cancels: 0,
+    cancel() { this.cancels++; this.status = 'idle' },
+    whenIdle: async () => {},
+    followup(message) { this.sent.push(message) },
+  }
+  agents.set('s1', agent)
+  return { ctx, descriptors, session, agent, service: ctx.messageRewind }
 }
 
-const human = (content, id) => createUserMessage({ content, source: { kind: 'user' }, ...(id ? { id } : {}) })
+const human = (content, rpcId = 'rpc') => createUserMessage({ content, source: { kind: 'user', rpcId } })
+const reply = text => createAssistantMessage({ content: [{ type: 'text', text }], provider: 'p', model: 'm', stopReason: 'stop' })
 
-test('records a checkpoint per human message, gates tools, restores, undoes, and follows fork lineage', async () => {
-  const { base, work, ctx, descriptors, image, file, fiber } = await setup()
-  try {
-    assert.equal(descriptors.length, 1)
-    assert.ok(ctx.get('messageRewind') instanceof Plugin.MessageRewindService)
-    const service = ctx.messageRewind
-    const session = ctx.sessions.create(SessionId('source-session'), { meta: { cwd: work, agentPreset: 'standard' } })
-    session.append('turn/start', { turn: 1 })
-    session.append('step/start', { turn: 1, step: 1 })
-    const runtime = session.append('user/message', createUserMessage({ content: [{ type: 'text', text: 'ctx' }], source: { kind: 'runtime-context', form: 'snapshot', sections: [] } }), { surfaceOp: 'append' })
-    const first = session.append('user/message', human([
-      { type: 'text', text: 'please edit ' },
-      { type: 'image', attachment: { attachmentId: 'a'.repeat(64), mediaType: 'image/png', bytes: image.length, width: 1, height: 1, name: 'shot.png' } },
-      { type: 'file', attachment: { attachmentId: 'b'.repeat(64), name: 'report.txt', bytes: file.length } },
-      { type: 'text', text: 'app.js' },
-    ]), { surfaceOp: 'append' })
+/** One closed Turn: the human message, optional tool activity, and a reply. */
+function turn(session, number, content, { edit = false, changes = false } = {}) {
+  session.append('agent/inbox/spliced', { target: 'next-turn', start: 0, removedCount: 0, inserted: [] })
+  session.append('turn/start', { turn: number })
+  session.append('step/start', { turn: number, step: 1 })
+  if (number === 1) session.append('system/message', { turn: 1, step: 1, message: { id: 'sys', role: 'system', source: { kind: 'system-prompt' }, content: [{ type: 'text', text: 'be helpful' }] } }, { surfaceOp: 'append' })
+  const message = session.append('user/message', human(content), { surfaceOp: 'append' })
+  if (edit) session.append('tool/call', { turn: number, step: 1, callId: `c${number}`, name: 'write', arguments: '{}' })
+  session.append('assistant/message', { turn: number, step: 1, message: reply(`answer ${number}`), stream: [] }, { surfaceOp: 'append' })
+  if (changes) session.append('workspace/changes', { turn: number })
+  session.append('turn/end', { turn: number, reason: { kind: 'completed' } })
+  return message
+}
 
-    // A tool waits for the checkpoint; when it runs, the file is still v1 in the checkpoint.
-    let gateResolved = false
-    const gate = ctx.waterfall('tools/pre-execute', { agent: { session } }, () => Promise.resolve({ kind: 'allow' })).then(result => { gateResolved = true; return result })
-    assert.deepEqual(await gate, { kind: 'allow' })
-    assert.ok(gateResolved)
-    await writeFile(join(work, 'app.js'), 'v2 edited by the agent')
-    await writeFile(join(work, 'new.js'), 'created by the agent')
-    session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+/** Drive the two hooks the loop runs for the next step, as `ReactLoopAgent.turn/step` do. */
+async function step(ctx, agent, number, messages) {
+  agent.session.append('turn/start', { turn: number })
+  agent.session.append('step/start', { turn: number, step: 1 })
+  await ctx.waterfall('agent/pre-step', { agent, messages, turn: number, step: 1, signal }, () => Promise.resolve({ kind: 'enter', messages }))
+  await ctx.waterfall('agent/request', { agent, turn: number, step: 1, signal }, () => Promise.resolve({ provider: 'p', model: 'm' }))
+  for (const message of messages) agent.session.append('user/message', message, { surfaceOp: 'append' })
+}
 
-    const records = await readdir(join(storeOf(base), 'sessions', 'source-session'))
-    assert.deepEqual(records, [`m-${first.seq}.json`], 'runtime context is not a rewind target')
-    assert.ok(runtime.seq < first.seq)
-
-    const info = await service.inspect({ sessionId: 'source-session', seq: first.seq }, signal)
-    assert.equal(info.boundary, null, 'nothing precedes the first message')
-    assert.equal(info.text, 'please edit app.js')
-    assert.deepEqual(info.attachments.map(item => [item.kind, item.name, item.available]), [['image', 'shot.png', true], ['file', 'report.txt', true]])
-    assert.equal(info.checkpoint.files, 1)
-    assert.equal(info.cwd, work)
-    assert.equal(info.agentPreset, 'standard')
-    assert.deepEqual(info.settings, { restoreFiles: true, archiveSource: true })
-
-    const shot = await service.attachment({ sessionId: 'source-session', seq: first.seq, index: 0 }, signal)
-    assert.equal(Buffer.from(shot.data, 'base64').toString(), image.toString())
-    assert.equal(shot.mediaType, 'image/png')
-    const report = await service.attachment({ sessionId: 'source-session', seq: first.seq, index: 1 }, signal)
-    assert.equal(Buffer.from(report.data, 'base64').toString(), file.toString())
-
-    const restored = await service.restore({ sessionId: 'source-session', seq: first.seq }, signal)
-    assert.equal(restored.restored, true)
-    assert.equal(await readFile(join(work, 'app.js'), 'utf8'), 'v1')
-    await assert.rejects(readFile(join(work, 'new.js')))
-    assert.match(restored.backupId, /^backup-/)
-
-    const undone = await service.undo({ sessionId: 'source-session', backupId: restored.backupId }, signal)
-    assert.equal(undone.restored, true)
-    assert.equal(await readFile(join(work, 'app.js'), 'utf8'), 'v2 edited by the agent')
-    assert.equal(await readFile(join(work, 'new.js'), 'utf8'), 'created by the agent')
-
-    // Second message; then a fork child inherits both, and resolves the first through lineage.
-    session.append('turn/start', { turn: 2 })
-    session.append('step/start', { turn: 2, step: 1 })
-    const second = session.append('user/message', human([{ type: 'text', text: 'second' }]), { surfaceOp: 'append' })
-    await service.settled('source-session')
-    session.append('turn/end', { turn: 2, reason: { kind: 'completed' } })
-    const secondInfo = await service.inspect({ sessionId: 'source-session', seq: second.seq }, signal)
-    assert.equal(secondInfo.boundary, first.seq + 1, 'keeps turn 1 through its turn/end')
-
-    const child = ctx.sessions.fork(session, secondInfo.boundary, SessionId('child-session'))
-    await service.link({ childId: child.id, sourceId: 'source-session', boundary: secondInfo.boundary }, signal)
-    const inherited = await service.inspect({ sessionId: 'child-session', seq: first.seq }, signal)
-    assert.equal(inherited.checkpoint.ownerSessionId, 'source-session')
-    await assert.rejects(service.inspect({ sessionId: 'child-session', seq: second.seq }, signal), /找不到/)
-
-    // Bad input never reaches the filesystem.
-    await assert.rejects(service.inspect({ sessionId: '../escape', seq: 1 }, signal))
-    await assert.rejects(service.undo({ sessionId: 'source-session', backupId: '../../x' }, signal))
-
-    // Expired Sessions and their blobs are collected.
-    const old = new Date(Date.now() - 40 * 86_400_000)
-    const dir = join(storeOf(base), 'sessions', 'source-session')
-    for (const name of await readdir(dir)) await utimes(join(dir, name), old, old)
-    const collected = await service.collect()
-    assert.equal(collected.sessions, 1)
-    assert.ok(collected.objects >= 2)
-
-    await fiber.dispose()
-    assert.equal(ctx.get('messageRewind'), undefined)
-  } finally {
-    await rm(base, { recursive: true, force: true })
-  }
+const surfaceTexts = session => session.surface.nodes.map(seq => {
+  const event = session.eventAt(seq)
+  const content = event.data.message?.content ?? event.data.content
+  return `${event.type}:${content.map(block => block.text ?? block.type).join('')}`
 })
 
-test('disabled recording still allows a chat-only rewind', async () => {
-  const base = await home('dmr-host-off-')
-  const ctx = new Context()
-  try {
-    ctx.provide('typert', { lookups: { register: () => () => {} }, contexts: { registerHost: () => () => {} }, remotes: { register: () => () => {} } })
-    ctx.provide('attachments', {})
-    await ctx.plugin(LlmRuntime)
-    await ctx.plugin(SessionStore)
-    await ctx.plugin(Plugin, { enabled: false })
-    const session = ctx.sessions.create(SessionId('off-session'), { meta: { cwd: base } })
-    session.append('turn/start', { turn: 1 })
-    const message = session.append('user/message', human([{ type: 'text', text: 'hi' }]), { surfaceOp: 'append' })
-    const info = await ctx.messageRewind.inspect({ sessionId: 'off-session', seq: message.seq }, signal)
-    assert.equal(info.checkpoint, null)
-    const result = await ctx.messageRewind.restore({ sessionId: 'off-session', seq: message.seq }, signal)
-    assert.equal(result.restored, false)
-  } finally {
-    await rm(base, { recursive: true, force: true })
-  }
+test('inspect reports text, attachments, later messages, and workspace edits after the message', async () => {
+  const { session, service, descriptors } = await setup()
+  assert.equal(descriptors.length, 1)
+  const first = turn(session, 1, [
+    { type: 'text', text: 'please ' },
+    { type: 'image', attachment: { attachmentId: 'a'.repeat(64), mediaType: 'image/png', bytes: image.length, width: 1, height: 1, name: 'shot.png' } },
+    { type: 'file', attachment: { attachmentId: 'b'.repeat(64), name: 'report.txt', bytes: file.length } },
+    { type: 'text', text: 'edit' },
+  ], { edit: true, changes: true })
+  const second = turn(session, 2, [{ type: 'text', text: 'second' }])
+
+  const info = await service.inspect({ sessionId: 's1', seq: first.seq }, signal)
+  assert.equal(info.refusal, null)
+  assert.equal(info.text, 'please edit')
+  assert.deepEqual(info.attachments.map(item => [item.kind, item.name, item.available]), [['image', 'shot.png', true], ['file', 'report.txt', true]])
+  assert.deepEqual(info.modified, { turns: 1, edits: 1 })
+  assert.equal(info.laterMessages, 1)
+
+  const latest = await service.inspect({ sessionId: 's1', seq: second.seq }, signal)
+  assert.deepEqual(latest.modified, { turns: 0, edits: 0 }, 'edits before the message do not count')
+  assert.equal(latest.laterMessages, 0)
+
+  const png = await service.attachment({ sessionId: 's1', seq: first.seq, index: 0 }, signal)
+  assert.equal(Buffer.from(png.data, 'base64').toString(), image.toString())
+  const report = await service.attachment({ sessionId: 's1', seq: first.seq, index: 1 }, signal)
+  assert.equal(Buffer.from(report.data, 'base64').toString(), file.toString())
+
+  const assistantSeq = session.surface.nodes.find(seq => session.eventAt(seq).type === 'assistant/message')
+  assert.equal((await service.inspect({ sessionId: 's1', seq: assistantSeq }, signal)).refusal, 'not-user')
+  assert.equal((await service.inspect({ sessionId: 's1', seq: 0 }, signal)).refusal, 'missing')
+})
+
+test('edit: arming withdraws nothing until the next human message, which replaces the target in place', async () => {
+  const { ctx, session, service, agent } = await setup()
+  turn(session, 1, [{ type: 'text', text: 'first' }])
+  const second = turn(session, 2, [{ type: 'text', text: 'second' }], { changes: true })
+  turn(session, 3, [{ type: 'text', text: 'third' }])
+
+  // Edits after the target need an acknowledged warning.
+  const refused = await service.arm({ sessionId: 's1', seq: second.seq, knownModified: false }, signal)
+  assert.equal(refused.status, 'confirm')
+  assert.deepEqual(refused.inspection.modified, { turns: 1, edits: 0 })
+
+  const armed = await service.arm({ sessionId: 's1', seq: second.seq, knownModified: true }, signal)
+  assert.deepEqual(armed, { status: 'armed', armed: { seq: second.seq, lastSeq: session.seq - 1 } })
+  assert.deepEqual(await service.state({ sessionId: 's1' }), { armed: armed.armed })
+  assert.equal(surfaceTexts(session).length, 7)
+  const lastNode = session.surface.nodes.at(-1)
+
+  // Runtime context alone does not consume the arm.
+  await ctx.waterfall('agent/pre-step', { agent, messages: [createUserMessage({ content: [{ type: 'text', text: 'ctx' }], source: { kind: 'runtime-context', form: 'snapshot', sections: [] } })], turn: 9, step: 9, signal }, () => Promise.resolve({ kind: 'enter', messages: [] }))
+  assert.notEqual((await service.state({ sessionId: 's1' })).armed, null)
+
+  await step(ctx, agent, 4, [human([{ type: 'text', text: 'second, edited' }], 'rpc-edit')])
+  assert.deepEqual(surfaceTexts(session), [
+    'system/message:be helpful', 'user/message:first', 'assistant/message:answer 1',
+    'system/message:', 'user/message:second, edited',
+  ])
+  const marker = session.snapshotEvents().find(event => event.type === 'system/message' && event.data.message.content.length === 0)
+  assert.deepEqual(marker.surfaceOp, { op: 'replace', startSeq: second.seq, endSeq: lastNode })
+  assert.equal(marker.data.turn, 4)
+  assert.deepEqual(await service.state({ sessionId: 's1' }), { armed: null })
+})
+
+test('disarm cancels a pending edit; later messages go out unchanged', async () => {
+  const { ctx, session, service, agent } = await setup()
+  const first = turn(session, 1, [{ type: 'text', text: 'first' }])
+  turn(session, 2, [{ type: 'text', text: 'second' }])
+  await service.arm({ sessionId: 's1', seq: first.seq, knownModified: false }, signal)
+  await service.disarm({ sessionId: 's1' })
+  await step(ctx, agent, 3, [human([{ type: 'text', text: 'third' }])])
+  assert.equal(surfaceTexts(session).length, 6)
+  assert.ok(!session.snapshotEvents().some(event => event.type === 'system/message' && event.data.message.content.length === 0))
+})
+
+test('retry: sends the original content with its durable attachments (and the note), replacing the target', async () => {
+  const { ctx, session, service, agent } = await setup()
+  turn(session, 1, [{ type: 'text', text: 'first' }])
+  const attachment = { attachmentId: 'a'.repeat(64), mediaType: 'image/png', bytes: 3, width: 1, height: 1, name: 'shot.png' }
+  const last = turn(session, 2, [{ type: 'text', text: 'draw' }, { type: 'image', attachment }], { edit: true })
+  agent.status = 'running'
+
+  const refused = await service.retry({ sessionId: 's1', seq: last.seq, knownModified: false, note: null }, signal)
+  assert.equal(refused.status, 'confirm', 'stopping surfaced an edit the client had not warned about')
+  assert.equal(agent.cancels, 1)
+  assert.equal(agent.sent.length, 0)
+
+  const sent = await service.retry({ sessionId: 's1', seq: last.seq, knownModified: true, note: 'NOTE' }, signal)
+  assert.deepEqual(sent, { status: 'sent' })
+  const [message] = agent.sent
+  assert.deepEqual(message.content, [{ type: 'text', text: 'draw' }, { type: 'image', attachment }, { type: 'text', text: '\n\nNOTE' }])
+  assert.equal(message.source.kind, 'user')
+  assert.match(message.source.rpcId, /^message-rewind:/)
+
+  await step(ctx, agent, 3, [message])
+  assert.deepEqual(surfaceTexts(session), [
+    'system/message:be helpful', 'user/message:first', 'assistant/message:answer 1',
+    'system/message:', 'user/message:drawimage\n\nNOTE',
+  ])
+})
+
+test('refusals and a missing agent are errors, not rewinds', async () => {
+  const { session, service } = await setup()
+  turn(session, 1, [{ type: 'text', text: 'only' }])
+  const reply = session.surface.nodes.at(-1)
+  await assert.rejects(service.arm({ sessionId: 's1', seq: reply, knownModified: true }, signal), /只能回退你发送的消息/)
+  await assert.rejects(service.inspect({ sessionId: 'nope', seq: 1 }, signal), /会话未加载/)
+  assert.equal(Plugin.refusalOf(session, session.surface.nodes[0]), 'head')
 })

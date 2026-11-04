@@ -1,110 +1,107 @@
 /**
- * Rewind a conversation to one of its user messages.
+ * Rewind a conversation to one of its user messages, in place.
  *
- * Host half. Before the agent acts on each message a human sends (an opening
- * message or one steered into a running turn), the plugin copies the Session
- * working directory into a content-addressed checkpoint and records where a
- * fork has to cut to stand just before that message. Tool execution waits
- * until the checkpoint is written, so no tool can change a file first.
+ * Host half. The Session log is append-only, so a rewind appends one empty
+ * system message whose surface replacement shadows the target message and
+ * everything after it — the same in-place mechanism `/compact` uses. The
+ * marker is appended at the `agent/request` of the step that admits the
+ * replacing message, right before that message joins the surface, so the
+ * model never sees the withdrawn exchange and nothing is withdrawn until a
+ * new message is actually sent.
  *
- * The browser half forks the conversation at the recorded cut, asks this
- * service to put the files back, archives the source, and returns the
- * message (text, images, files) to the composer — or sends it again for a
- * regenerated reply. Every restore first checkpoints the current files, so it
- * can be undone.
+ * - Edit: `arm` marks the target; the next message the person sends (from the
+ *   composer, with the original text and attachments refilled by the client)
+ *   replaces it.
+ * - Retry: `retry` sends the original message again, reusing its durable
+ *   attachment references, and replaces the target with it.
+ *
+ * Workspace files are not restored. `inspect` reports the file edits recorded
+ * after the target so the client can warn before a rewind.
  */
 import { randomUUID } from 'node:crypto'
-import { mkdir, readdir, readFile, rm, stat } from 'node:fs/promises'
-import { homedir } from 'node:os'
-import { join, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
+import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-attachment'
 import type {} from '@deepseek-ai/dsh-session'
-import type {} from '@deepseek-ai/dsh-tools'
 import { Remote, RemoteError, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import z from '@deepseek-ai/schemastery'
-import { forkBoundary, isHumanMessage, messageContent, pendingInboxIds, type EventLike, type MessageBlock } from './boundary.js'
-import { CheckpointStore, sanitizeManifest, type CheckpointLimits, type CheckpointManifest } from './checkpoint.js'
 import {
-  attachmentRequestSchema, linkSchema, remoteInfo, targetSchema, undoSchema,
-  type RewindAttachmentData, type RewindAttachmentInfo, type RewindInspection, type RewindRestoreResult,
+  armSchema, attachmentRequestSchema, remoteInfo, retrySchema, sessionSchema, targetSchema,
+  type RewindArmed, type RewindArmResult, type RewindAttachmentData, type RewindAttachmentInfo,
+  type RewindInspection, type RewindModified, type RewindRetryResult,
 } from './remote.js'
 
-export { forkBoundary, isHumanMessage, pendingInboxIds } from './boundary.js'
-export { CheckpointStore, walk } from './checkpoint.js'
-
 export const name = 'dsh-message-rewind'
-export const inject = ['typert', 'attachments']
+export const inject = ['typert', 'attachments', 'agents']
 
 export interface Settings {
-  enabled: boolean
-  restoreFiles: boolean
-  archiveSource: boolean
-  maxFileBytes: number
-  maxFiles: number
-  excludeDirs: string[]
-  gitignore: boolean
-  retentionDays: number
+  mutatingTools: string[]
   attachmentMaxBytes: number
-  snapshotTimeoutMs: number
+  stopTimeoutMs: number
 }
 
 export const Config: z<Settings> = z.object({
-  enabled: z.boolean().default(true).description('发送消息时记录工作区检查点'),
-  restoreFiles: z.boolean().default(true).description('回退时恢复工作区文件'),
-  archiveSource: z.boolean().default(true).description('回退后归档原会话'),
-  maxFileBytes: z.natural().min(1).default(20 * 1024 * 1024).description('单个文件超过此字节数时不记录、不恢复'),
-  maxFiles: z.natural().min(1).default(20000).description('每个检查点最多记录的文件数'),
-  excludeDirs: z.array(z.string()).default(['node_modules', '.venv', 'venv', '__pycache__', '.cache', '.next', '.turbo']).description('任意层级下不记录的目录名（.git 始终排除）'),
-  gitignore: z.boolean().default(true).description('遵循 .gitignore'),
-  retentionDays: z.natural().min(1).default(30).description('检查点保留天数'),
+  mutatingTools: z.array(z.string()).default(['write', 'edit']).description('视为修改工作区文件的工具名；回退或重新生成涉及这些工具时弹出警告'),
   attachmentMaxBytes: z.natural().min(1).default(64 * 1024 * 1024).description('回填输入框时单个附件的最大字节数'),
-  snapshotTimeoutMs: z.natural().min(1000).default(30_000).description('单次检查点最长耗时（毫秒）；超时后工具照常执行，这条消息不恢复文件'),
+  stopTimeoutMs: z.natural().min(1000).default(20_000).description('回退前等待运行中的任务停止的最长时间（毫秒）'),
 }) as never
 
-/** One recorded user message: its checkpoint and the facts a rewind needs. */
-interface MessageRecord {
-  version: 1
-  sessionId: string
+/** The event fields these reads depend on. */
+export interface EventLike {
+  type: string
   seq: number
-  messageId: string | null
-  createdAt: number
-  boundary: number | null
-  inheritedQueue: string[]
-  content: MessageBlock[]
-  cwd: string
-  agentPreset: string | null
-  /** Hash of the checkpoint manifest blob; null when recording was disabled or failed. */
-  tree: string | null
-  files: number
-  skipped: number
-  truncated: boolean
+  data?: any
 }
 
-interface Lineage {
-  [childId: string]: { sourceId: string; boundary: number | null; linkedAt: number }
-}
+/** One content block of a durable user message. */
+export type MessageBlock =
+  | { type: 'text'; text: string }
+  | { type: 'image'; attachment: { attachmentId: string; mediaType: string; bytes: number; name?: string } }
+  | { type: 'file'; attachment: { attachmentId: string; name: string; bytes: number } }
+  | { type: string; [key: string]: unknown }
 
-interface SessionLike {
+export interface SessionLike {
   id: string
-  header: { cwd?: string; origin?: string; delegationDepth?: number; agentPreset?: string }
-  snapshotEvents?: (from?: number, to?: number) => readonly EventLike[]
+  seq: number
+  surface: { nodes: readonly number[] }
+  eventAt(seq: number): EventLike | undefined
+  snapshotEvents(from?: number, to?: number): readonly EventLike[]
+  append(type: string, data: unknown, options?: unknown): EventLike
 }
 
-const SAFE_ID = /^[A-Za-z0-9._-]{1,200}$/
-
-/** The working directory of a top-level Session; subagents share their parent's checkpoints. */
-function eligible(session: SessionLike): string | undefined {
-  const { cwd, origin, delegationDepth } = session.header
-  return origin === 'subagent' || (delegationDepth ?? 0) > 0 ? undefined : cwd
+export interface AgentLike {
+  id: string
+  status: string
+  session: SessionLike
+  cancel(cause: { kind: 'user' }, options?: { keepInbox?: boolean }): void
+  whenIdle(): Promise<void>
+  followup(message: unknown): void
 }
 
-function readEvents(session: SessionLike | undefined, toExclusive?: number): readonly EventLike[] | undefined {
-  try { return session?.snapshotEvents?.(0, toExclusive) } catch { return undefined }
+interface MessageLike {
+  id?: string
+  content?: unknown
+  source?: { kind?: unknown; rpcId?: unknown }
+}
+
+type Refusal = RewindInspection['refusal']
+
+/** Whether one event is a message the human sent (not runtime context or other injected input). */
+export function isHumanMessage(event: EventLike | undefined): boolean {
+  return event?.type === 'user/message' && event.data?.source?.kind === 'user'
+}
+
+function isHumanPrompt(message: MessageLike): boolean {
+  return message.source?.kind === 'user' && typeof message.source.rpcId === 'string'
+}
+
+function contentOf(event: EventLike | undefined): MessageBlock[] {
+  const content = event?.data?.content
+  return Array.isArray(content) ? content as MessageBlock[] : []
 }
 
 function attachmentsOf(content: readonly MessageBlock[]) {
-  return content.filter((block): block is Extract<MessageBlock, { type: 'image' | 'file' }> & { attachment: any } =>
+  return content.filter((block): block is MessageBlock & { type: 'image' | 'file'; attachment: any } =>
     (block.type === 'image' || block.type === 'file') && typeof (block as any).attachment === 'object' && (block as any).attachment !== null)
 }
 
@@ -112,171 +109,154 @@ function textOf(content: readonly MessageBlock[]): string {
   return content.filter(block => block.type === 'text' && typeof (block as any).text === 'string').map(block => (block as any).text as string).join('')
 }
 
+/**
+ * Why `seq` cannot be rewound in place, or null when it can.
+ * @param session - the live Session.
+ * @param seq - candidate human message.
+ */
+export function refusalOf(session: SessionLike, seq: number): Refusal {
+  const index = session.surface.nodes.indexOf(seq)
+  if (index < 0) return 'missing'
+  if (index === 0) return 'head'
+  return isHumanMessage(session.eventAt(seq)) ? null : 'not-user'
+}
+
+/**
+ * Workspace edits and human messages recorded after `seq`.
+ * @param events - the log from `seq` on.
+ * @param seq - target message.
+ * @param tools - names of file-editing tools.
+ * @param surface - current surface nodes, to count only messages still in context.
+ */
+export function laterActivity(events: readonly EventLike[], seq: number, tools: readonly string[], surface: readonly number[]): { modified: RewindModified; laterMessages: number } {
+  const turns = new Set<unknown>()
+  const visible = new Set(surface)
+  let edits = 0
+  let laterMessages = 0
+  for (const event of events) {
+    if (event.seq <= seq) continue
+    if (event.type === 'workspace/changes') turns.add(event.data?.turn ?? event.seq)
+    else if (event.type === 'tool/call' && tools.includes(event.data?.name)) edits++
+    else if (isHumanMessage(event) && visible.has(event.seq)) laterMessages++
+  }
+  return { modified: { turns: turns.size, edits }, laterMessages }
+}
+
+/**
+ * Shadow `target` and every later surface node with one empty system message.
+ * @param session - the live Session, between `agent/request` and the step's input.
+ * @param target - human message to withdraw.
+ * @param turn - current turn.
+ * @param step - current step.
+ * @returns the marker event.
+ */
+export function rewindSurface(session: SessionLike, target: number, turn: number, step: number): EventLike {
+  const refusal = refusalOf(session, target)
+  if (refusal !== null) throw new Error(`message ${target} cannot be rewound (${refusal})`)
+  const nodes = [...session.surface.nodes]
+  const shadowed = nodes.slice(nodes.indexOf(target))
+  return session.append('system/message', {
+    turn,
+    step,
+    // Empty later system nodes are dormant: they project to no provider message.
+    message: { id: randomUUID(), role: 'system', source: { kind: 'system-prompt' }, content: [] },
+  }, {
+    surfaceOp: { op: 'replace', startSeq: shadowed[0], endSeq: shadowed[shadowed.length - 1] },
+    sourceEventSeqs: shadowed,
+  })
+}
+
 declare module '@deepseek-ai/cordis' {
   interface Context { messageRewind: MessageRewindService }
 }
 
-export class MessageRewindService extends TypertRemoteService {
-  readonly store: CheckpointStore
-  private readonly pending = new Map<string, Promise<void>>()
-  private readonly locks = new Map<string, Promise<unknown>>()
-  private lineageWrite: Promise<unknown> = Promise.resolve()
+const errorText = (error: unknown) => error instanceof Error ? error.message : String(error)
 
-  constructor(ctx: Context, private readonly settings: () => Settings, readonly directory: string) {
+function refusalText(refusal: NonNullable<Refusal>): string {
+  return {
+    missing: '这条消息已不在模型上下文中（可能已被压缩），无法回退。',
+    head: '会话开头的消息无法回退。',
+    'not-user': '只能回退你发送的消息。',
+  }[refusal]
+}
+
+export class MessageRewindService extends TypertRemoteService {
+  /** Edits waiting for the next human message, per live Agent. */
+  private readonly armed = new WeakMap<object, RewindArmed>()
+  /** Retried messages by id → the target they replace. */
+  private readonly retries = new Map<string, number>()
+  /** Rewinds to apply at this Agent's next matching `agent/request`. */
+  private readonly plans = new WeakMap<object, { turn: number; step: number; target: number }>()
+  private readonly inflight = new Set<string>()
+
+  constructor(ctx: Context, private readonly settings: () => Settings) {
     super(ctx, 'messageRewind')
-    this.store = new CheckpointStore(directory)
   }
 
-  limits(): CheckpointLimits {
-    const settings = this.settings()
+  private lookup(sessionId: string): AgentLike | undefined {
+    return (this.ctx as any).agents?.get?.(sessionId) as AgentLike | undefined
+  }
+
+  private agent(sessionId: string): AgentLike {
+    const agent = this.lookup(sessionId)
+    if (agent === undefined) throw new RemoteError('gateway/bad-request', '会话未加载，请重新打开后再试。', {})
+    return agent
+  }
+
+  private describe(agent: AgentLike, seq: number): RewindInspection {
+    const session = agent.session
+    const content = contentOf(session.eventAt(seq))
+    const limit = this.settings().attachmentMaxBytes
+    const attachments: RewindAttachmentInfo[] = attachmentsOf(content).map(block => ({
+      kind: block.type,
+      name: String(block.attachment.name ?? (block.type === 'image' ? 'image' : 'file')),
+      bytes: Number(block.attachment.bytes ?? 0),
+      ...(block.type === 'image' ? { mediaType: String(block.attachment.mediaType) } : {}),
+      available: Number(block.attachment.bytes ?? 0) <= limit,
+    }))
+    const activity = laterActivity(session.snapshotEvents(seq), seq, this.settings().mutatingTools, session.surface.nodes)
     return {
-      maxFileBytes: settings.maxFileBytes,
-      maxFiles: settings.maxFiles,
-      excludeDirs: settings.excludeDirs,
-      gitignore: settings.gitignore,
-      excludePaths: [this.directory, process.env.DSH_HOME || join(homedir(), '.dsh')],
+      sessionId: session.id, seq, refusal: refusalOf(session, seq),
+      text: textOf(content), attachments, ...activity,
+      running: agent.status !== 'idle',
     }
   }
 
-  private sessionDir(sessionId: string): string {
-    if (!SAFE_ID.test(sessionId)) throw new RemoteError('gateway/bad-request', '会话标识无效。', {})
-    return join(this.directory, 'sessions', sessionId)
-  }
-
-  private recordPath(sessionId: string, seq: number): string {
-    return join(this.sessionDir(sessionId), `m-${seq}.json`)
-  }
-
-  /** Serialize work on one key (a working directory). */
-  private exclusive<T>(key: string, work: () => Promise<T>): Promise<T> {
-    const previous = this.locks.get(key) ?? Promise.resolve()
-    const next = previous.catch(() => {}).then(work)
-    const tail = next.catch(() => {})
-    this.locks.set(key, tail)
-    void tail.then(() => { if (this.locks.get(key) === tail) this.locks.delete(key) })
-    return next
-  }
-
-  /** Resolves once this Session's queued checkpoints are written. */
-  settled(sessionId: string): Promise<void> {
-    return this.pending.get(sessionId) ?? Promise.resolve()
+  /** Stop a running Agent, discarding its queued input: all of it comes after the target. */
+  private async stop(agent: AgentLike): Promise<void> {
+    if (agent.status === 'idle') return
+    agent.cancel({ kind: 'user' })
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        agent.whenIdle(),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('stop-timeout')), this.settings().stopTimeoutMs) }),
+      ])
+    } catch {
+      throw new RemoteError('gateway/bad-request', '当前任务未能及时停止，请稍后再试。', {})
+    } finally {
+      clearTimeout(timer)
+    }
   }
 
   /**
-   * Queue the checkpoint for one human message just appended to `session`.
-   * @param session - the live Session.
-   * @param event - its `user/message` event.
+   * Stop the Agent, re-check the target, and run `act` unless stopping
+   * surfaced workspace edits the person has not been warned about.
    */
-  record(session: SessionLike, event: EventLike): void {
-    const cwd = eligible(session)
-    if (cwd === undefined || !SAFE_ID.test(session.id)) return
-    const events = readEvents(session, event.seq + 1)
-    const boundary = events ? forkBoundary(events, event.seq) : (event.seq > 0 ? event.seq - 1 : null)
-    const inheritedQueue = events && boundary !== null ? pendingInboxIds(events, boundary) : []
-    const settings = this.settings()
-    const base: MessageRecord = {
-      version: 1,
-      sessionId: session.id,
-      seq: event.seq,
-      messageId: typeof (event.data as any)?.id === 'string' ? (event.data as any).id : null,
-      createdAt: Date.now(),
-      boundary,
-      inheritedQueue,
-      content: messageContent(event),
-      cwd: resolve(cwd),
-      agentPreset: session.header.agentPreset ?? null,
-      tree: null, files: 0, skipped: 0, truncated: false,
-    }
-    const previous = this.pending.get(session.id) ?? Promise.resolve()
-    const work = previous.then(async () => {
-      let record = base
-      if (settings.enabled) {
-        try {
-          const manifest = await this.exclusive(base.cwd, () => this.store.snapshot(base.cwd, this.limits(), AbortSignal.timeout(settings.snapshotTimeoutMs)))
-          const { cwd: _cwd, createdAt: _createdAt, ...tree } = manifest
-          record = { ...base, tree: await this.store.putJson(tree), files: Object.keys(manifest.entries).length, skipped: manifest.skipped.length, truncated: manifest.truncated }
-        } catch (error) {
-          this.ctx.logger.warn('message-rewind: checkpoint of %s failed: %s', base.cwd, error instanceof Error ? error.message : String(error))
-        }
-      }
-      await this.store.writeJson(this.recordPath(session.id, event.seq), record)
-    }).catch(error => {
-      this.ctx.logger.warn('message-rewind: recording message %d of %s failed: %s', event.seq, session.id, error instanceof Error ? error.message : String(error))
-    })
-    this.pending.set(session.id, work)
-    void work.then(() => { if (this.pending.get(session.id) === work) this.pending.delete(session.id) })
-  }
-
-  private async readLineage(): Promise<Lineage> {
-    try { return JSON.parse(await readFile(join(this.directory, 'lineage.json'), 'utf8')) as Lineage } catch { return {} }
-  }
-
-  /** The record for `seq` in `sessionId`, following fork lineage for inherited messages. */
-  private async findRecord(sessionId: string, seq: number): Promise<MessageRecord | undefined> {
-    await this.settled(sessionId)
-    const lineage = await this.readLineage()
-    const visited = new Set<string>()
-    let current = sessionId
-    while (!visited.has(current)) {
-      visited.add(current)
-      try {
-        const record = JSON.parse(await readFile(this.recordPath(current, seq), 'utf8')) as MessageRecord
-        if (record.version === 1 && record.seq === seq) return record
-      } catch { /* Not recorded here. */ }
-      const link = lineage[current]
-      if (link === undefined || link.boundary === null || seq > link.boundary) return undefined
-      current = link.sourceId
-    }
-    return undefined
-  }
-
-  private liveSession(sessionId: string): SessionLike | undefined {
-    try { return (this.ctx.get('sessions') as { get?: (id: string) => SessionLike | undefined } | undefined)?.get?.(sessionId) } catch { return undefined }
-  }
-
-  /** The record, or one derived from the live log when the message predates this plugin. */
-  private async resolveTarget(sessionId: string, seq: number): Promise<MessageRecord> {
-    const recorded = await this.findRecord(sessionId, seq)
-    if (recorded) return recorded
-    const session = this.liveSession(sessionId)
-    const events = readEvents(session, seq + 1)
-    const event = events?.[seq]
-    if (!session || !events || !event || !isHumanMessage(event)) {
-      throw new RemoteError('gateway/bad-request', '找不到这条用户消息的记录；请重新打开会话后再试。', {})
-    }
-    const boundary = forkBoundary(events, seq)
-    return {
-      version: 1, sessionId, seq, messageId: (event.data as any)?.id ?? null, createdAt: Date.now(),
-      boundary, inheritedQueue: boundary === null ? [] : pendingInboxIds(events, boundary),
-      content: messageContent(event), cwd: session.header.cwd ? resolve(session.header.cwd) : '',
-      agentPreset: session.header.agentPreset ?? null, tree: null, files: 0, skipped: 0, truncated: false,
-    }
-  }
-
-  private async manifestOf(record: MessageRecord): Promise<CheckpointManifest> {
-    if (record.tree === null) throw new RemoteError('gateway/bad-request', '这条消息没有文件检查点。', {})
-    const tree = await this.store.readJson<Omit<CheckpointManifest, 'cwd' | 'createdAt'>>(record.tree)
-    return sanitizeManifest({ ...tree, version: 1, cwd: record.cwd, createdAt: record.createdAt })
-  }
-
-  private async restoreManifest(sessionId: string, manifest: CheckpointManifest): Promise<RewindRestoreResult> {
+  private async prepare<T>(sessionId: string, seq: number, knownModified: boolean, act: (agent: AgentLike) => T): Promise<T | { status: 'confirm'; inspection: RewindInspection }> {
+    if (this.inflight.has(sessionId)) throw new RemoteError('gateway/bad-request', '正在处理上一次回退，请稍候。', {})
+    this.inflight.add(sessionId)
     try {
-      if (!(await stat(manifest.cwd)).isDirectory()) throw new Error('not a directory')
-    } catch {
-      throw new RemoteError('gateway/bad-request', `工作目录不存在：${manifest.cwd}`, {})
+      const agent = this.agent(sessionId)
+      await this.stop(agent)
+      const inspection = this.describe(agent, seq)
+      if (inspection.refusal !== null) throw new RemoteError('gateway/bad-request', refusalText(inspection.refusal), {})
+      const modified = inspection.modified.turns + inspection.modified.edits > 0
+      if (modified && !knownModified) return { status: 'confirm', inspection }
+      return act(agent)
+    } finally {
+      this.inflight.delete(sessionId)
     }
-    return this.exclusive(manifest.cwd, async () => {
-      const limits = this.limits()
-      const before = await this.store.snapshot(manifest.cwd, limits)
-      const { cwd: _cwd, createdAt: _createdAt, ...tree } = before
-      const backupId = `backup-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`
-      await this.store.writeJson(join(this.sessionDir(sessionId), `${backupId}.json`), {
-        version: 1, kind: 'backup', cwd: before.cwd, createdAt: before.createdAt, tree: await this.store.putJson(tree),
-      })
-      const result = await this.store.restore(manifest, limits)
-      this.ctx.logger.info('message-rewind: restored %s (%d written, %d deleted, %d failed)', manifest.cwd, result.written, result.deleted, result.failed.length)
-      return { restored: true, ...result, backupId }
-    })
   }
 
   @Remote
@@ -284,29 +264,7 @@ export class MessageRewindService extends TypertRemoteService {
     signal.throwIfAborted()
     const parsed = targetSchema.safeParse(request)
     if (!parsed.success) throw new RemoteError('gateway/bad-request', '回退参数无效。', {})
-    const { sessionId, seq } = parsed.data
-    const record = await this.resolveTarget(sessionId, seq)
-    const settings = this.settings()
-    const attachments: RewindAttachmentInfo[] = attachmentsOf(record.content).map(block => ({
-      kind: block.type as 'image' | 'file',
-      name: String(block.attachment.name ?? (block.type === 'image' ? 'image' : 'file')),
-      bytes: Number(block.attachment.bytes ?? 0),
-      ...(block.type === 'image' ? { mediaType: String(block.attachment.mediaType) } : {}),
-      available: Number(block.attachment.bytes ?? 0) <= settings.attachmentMaxBytes,
-    }))
-    return {
-      sessionId, seq,
-      boundary: record.boundary,
-      inheritedQueue: record.inheritedQueue,
-      text: textOf(record.content),
-      attachments,
-      checkpoint: record.tree === null ? null : {
-        createdAt: record.createdAt, files: record.files, skipped: record.skipped, truncated: record.truncated, ownerSessionId: record.sessionId,
-      },
-      cwd: record.cwd || null,
-      agentPreset: record.agentPreset,
-      settings: { restoreFiles: settings.restoreFiles, archiveSource: settings.archiveSource },
-    }
+    return this.describe(this.agent(parsed.data.sessionId), parsed.data.seq)
   }
 
   @Remote
@@ -314,8 +272,9 @@ export class MessageRewindService extends TypertRemoteService {
     const parsed = attachmentRequestSchema.safeParse(request)
     if (!parsed.success) throw new RemoteError('gateway/bad-request', '附件参数无效。', {})
     const { sessionId, seq, index } = parsed.data
-    const record = await this.resolveTarget(sessionId, seq)
-    const block = attachmentsOf(record.content)[index]
+    const event = this.agent(sessionId).session.eventAt(seq)
+    if (!isHumanMessage(event)) throw new RemoteError('gateway/bad-request', '找不到这条用户消息。', {})
+    const block = attachmentsOf(contentOf(event))[index]
     if (block === undefined) throw new RemoteError('gateway/bad-request', '附件不存在。', {})
     const limit = this.settings().attachmentMaxBytes
     if (Number(block.attachment.bytes ?? 0) > limit) throw new RemoteError('gateway/bad-request', '附件超过回填大小上限。', {})
@@ -334,121 +293,96 @@ export class MessageRewindService extends TypertRemoteService {
   }
 
   @Remote
-  async restore(request: unknown, signal: AbortSignal): Promise<RewindRestoreResult> {
+  async arm(request: unknown, signal: AbortSignal): Promise<RewindArmResult> {
     signal.throwIfAborted()
-    const parsed = targetSchema.safeParse(request)
+    const parsed = armSchema.safeParse(request)
     if (!parsed.success) throw new RemoteError('gateway/bad-request', '回退参数无效。', {})
-    const { sessionId, seq } = parsed.data
-    if (!this.settings().restoreFiles) return { restored: false, written: 0, deleted: 0, unchanged: 0, failed: [], backupId: null }
-    const record = await this.resolveTarget(sessionId, seq)
-    if (record.tree === null) return { restored: false, written: 0, deleted: 0, unchanged: 0, failed: [], backupId: null }
-    return this.restoreManifest(sessionId, await this.manifestOf(record))
-  }
-
-  @Remote
-  async undo(request: unknown, signal: AbortSignal): Promise<RewindRestoreResult> {
-    signal.throwIfAborted()
-    const parsed = undoSchema.safeParse(request)
-    if (!parsed.success) throw new RemoteError('gateway/bad-request', '撤销参数无效。', {})
-    const { sessionId, backupId } = parsed.data
-    let backup: { cwd: string; createdAt: number; tree: string }
-    try { backup = JSON.parse(await readFile(join(this.sessionDir(sessionId), `${backupId}.json`), 'utf8')) } catch {
-      throw new RemoteError('gateway/bad-request', '找不到回退前的文件备份。', {})
-    }
-    const tree = await this.store.readJson<Omit<CheckpointManifest, 'cwd' | 'createdAt'>>(backup.tree)
-    return this.restoreManifest(sessionId, sanitizeManifest({ ...tree, version: 1, cwd: backup.cwd, createdAt: backup.createdAt }))
-  }
-
-  @Remote
-  async link(request: unknown, signal: AbortSignal): Promise<{ ok: true }> {
-    signal.throwIfAborted()
-    const parsed = linkSchema.safeParse(request)
-    if (!parsed.success || !SAFE_ID.test(parsed.data.childId) || !SAFE_ID.test(parsed.data.sourceId)) {
-      throw new RemoteError('gateway/bad-request', '会话关联参数无效。', {})
-    }
-    const { childId, sourceId, boundary } = parsed.data
-    const write = this.lineageWrite.catch(() => {}).then(async () => {
-      const lineage = await this.readLineage()
-      lineage[childId] = { sourceId, boundary, linkedAt: Date.now() }
-      await this.store.writeJson(join(this.directory, 'lineage.json'), lineage)
+    const { sessionId, seq, knownModified } = parsed.data
+    return this.prepare(sessionId, seq, knownModified, agent => {
+      const armed = { seq, lastSeq: agent.session.seq - 1 }
+      this.armed.set(agent, armed)
+      return { status: 'armed' as const, armed }
     })
-    this.lineageWrite = write
-    await write
+  }
+
+  @Remote
+  async disarm(request: unknown): Promise<{ ok: true }> {
+    const parsed = sessionSchema.safeParse(request)
+    if (!parsed.success) throw new RemoteError('gateway/bad-request', '参数无效。', {})
+    const agent = this.lookup(parsed.data.sessionId)
+    if (agent) this.armed.delete(agent)
     return { ok: true }
   }
 
-  /**
-   * Remove checkpoints of Sessions idle longer than the retention period and
-   * every blob no remaining record references.
-   * @returns removed Session directories and blobs.
-   */
-  async collect(now = Date.now()): Promise<{ sessions: number; objects: number }> {
-    const cutoff = now - this.settings().retentionDays * 86_400_000
-    const root = join(this.directory, 'sessions')
-    const referenced = new Set<string>()
-    let sessions = 0
-    let names: string[] = []
-    try { names = await readdir(root) } catch { /* Nothing recorded yet. */ }
-    for (const name of names) {
-      const dir = join(root, name)
-      let files: string[]
-      try { files = await readdir(dir) } catch { continue }
-      let newest = 0
-      for (const file of files) {
-        try { newest = Math.max(newest, (await stat(join(dir, file))).mtimeMs) } catch { /* Raced removal. */ }
-      }
-      if (newest < cutoff) { await rm(dir, { recursive: true, force: true }); sessions++; continue }
-      for (const file of files) {
-        if (!file.endsWith('.json')) continue
-        try {
-          const tree = (JSON.parse(await readFile(join(dir, file), 'utf8')) as { tree?: unknown }).tree
-          if (typeof tree !== 'string') continue
-          referenced.add(tree)
-          const manifest = await this.store.readJson<{ entries?: Record<string, { kind: string; hash?: string }> }>(tree)
-          for (const entry of Object.values(manifest.entries ?? {})) if (entry.kind === 'file' && entry.hash) referenced.add(entry.hash)
-        } catch { /* An unreadable record keeps nothing alive. */ }
-      }
+  @Remote
+  async state(request: unknown): Promise<{ armed: RewindArmed | null }> {
+    const parsed = sessionSchema.safeParse(request)
+    if (!parsed.success) throw new RemoteError('gateway/bad-request', '参数无效。', {})
+    const agent = this.lookup(parsed.data.sessionId)
+    return { armed: (agent && this.armed.get(agent)) ?? null }
+  }
+
+  @Remote
+  async retry(request: unknown, signal: AbortSignal): Promise<RewindRetryResult> {
+    signal.throwIfAborted()
+    const parsed = retrySchema.safeParse(request)
+    if (!parsed.success) throw new RemoteError('gateway/bad-request', '重新生成参数无效。', {})
+    const { sessionId, seq, knownModified, note } = parsed.data
+    return this.prepare(sessionId, seq, knownModified, agent => {
+      const event = agent.session.eventAt(seq)
+      const content: MessageBlock[] = [...contentOf(event)]
+      if (note) content.push({ type: 'text', text: `\n\n${note}` })
+      const source = { ...(event?.data?.source ?? { kind: 'user' }), rpcId: `message-rewind:${randomUUID()}` }
+      // The original durable attachment references are reused as they are.
+      const message = Object.freeze({ id: randomUUID(), role: 'user', content: structuredClone(content), source })
+      this.armed.delete(agent)
+      this.retries.set(message.id, seq)
+      agent.followup(message)
+      return { status: 'sent' as const }
+    })
+  }
+
+  /** `agent/pre-step`: a step admitting a retried or edited message plans its rewind. */
+  claim(agent: AgentLike, messages: readonly MessageLike[], turn: number, step: number): void {
+    for (const message of messages) {
+      const target = typeof message.id === 'string' ? this.retries.get(message.id) : undefined
+      if (target === undefined) continue
+      this.retries.delete(message.id!)
+      this.plans.set(agent, { turn, step, target })
+      return
     }
-    // Writers in flight may have stored blobs their record does not list yet.
-    if (this.pending.size > 0 || this.locks.size > 0) return { sessions, objects: 0 }
-    const objects = await this.store.sweep(referenced)
-    const lineage = await this.readLineage()
-    let changed = false
-    for (const [child, link] of Object.entries(lineage)) {
-      if (link.linkedAt < cutoff) { delete lineage[child]; changed = true }
+    const armed = this.armed.get(agent)
+    if (armed !== undefined && messages.some(isHumanPrompt)) {
+      this.armed.delete(agent)
+      this.plans.set(agent, { turn, step, target: armed.seq })
     }
-    if (changed) await this.store.writeJson(join(this.directory, 'lineage.json'), lineage)
-    return { sessions, objects }
+  }
+
+  /** `agent/request`: shadow the withdrawn range before the step's new message is admitted. */
+  apply(agent: AgentLike, turn: number, step: number): void {
+    const plan = this.plans.get(agent)
+    if (plan === undefined || plan.turn !== turn || plan.step !== step) return
+    this.plans.delete(agent)
+    try {
+      rewindSurface(agent.session, plan.target, turn, step)
+    } catch (error) {
+      // The message still goes out; only the withdrawal is skipped.
+      this.ctx.logger.warn('message-rewind: rewinding %s to %d failed: %s', agent.id, plan.target, errorText(error))
+    }
   }
 }
 
 export function apply(ctx: Context, config: Partial<Settings> = {}): void {
   const settings = () => (Config as unknown as (value: unknown) => Settings)(config)
-  // Persistent beside other plugin storages: `data/.dsh/storages` in this deployment.
-  const directory = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'storages', 'dsh-message-rewind')
   ctx.typert.remotes.register(remoteInfo)
-  const service = new MessageRewindService(ctx, settings, directory)
-  void mkdir(directory, { recursive: true }).catch(() => {})
-
-  ctx.on('session/event', (session: any, event: any) => {
-    if (isHumanMessage(event)) service.record(session as SessionLike, event as EventLike)
-  })
-
-  // Tools run only after the message's checkpoint exists.
-  ;(ctx as any).on('tools/pre-execute', async (exec: any, next: () => Promise<unknown>) => {
-    const id = exec?.agent?.session?.id
-    if (typeof id === 'string') await service.settled(id)
+  const service = new MessageRewindService(ctx, settings)
+  const on = (ctx as any).on.bind(ctx)
+  on('agent/pre-step', async (payload: { agent: AgentLike; messages: readonly MessageLike[]; turn: number; step: number }, next: () => Promise<unknown>) => {
+    service.claim(payload.agent, payload.messages, payload.turn, payload.step)
     return next()
   })
-
-  const collect = () => {
-    void service.collect().then(({ sessions, objects }) => {
-      if (sessions || objects) ctx.logger.info('message-rewind: removed %d expired session checkpoints and %d blobs', sessions, objects)
-    }).catch(error => ctx.logger.warn('message-rewind: cleanup failed: %s', error instanceof Error ? error.message : String(error)))
-  }
-  const first = setTimeout(collect, 60_000)
-  const daily = setInterval(collect, 86_400_000)
-  first.unref?.()
-  daily.unref?.()
-  ctx.effect(() => () => { clearTimeout(first); clearInterval(daily) }, 'message-rewind: cleanup timers')
+  on('agent/request', async (payload: { agent: AgentLike; turn: number; step: number }, next: () => Promise<unknown>) => {
+    service.apply(payload.agent, payload.turn, payload.step)
+    return next()
+  })
 }

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import type { RewindInspection } from '../remote.js'
-import type { RewindController, RewindMode, RewindNotice, RewindStep } from './controller.js'
+import type { RewindController, RewindMode, RewindNotice, RewindOptions } from './controller.js'
 import { format } from './locales.js'
 
 export type Translate = (key: string) => string
@@ -30,32 +30,41 @@ export function RefreshIcon() {
 type Phase =
   | { kind: 'idle' }
   | { kind: 'loading' }
-  | { kind: 'confirm'; info: RewindInspection; running: boolean }
-  | { kind: 'working'; step: RewindStep }
+  /** Workspace files were edited after the message: cancel, confirm, or confirm and tell the model. */
+  | { kind: 'warn'; info: RewindInspection }
+  /** Nothing was edited, but the rewind withdraws later turns or stops a running task. */
+  | { kind: 'confirm'; info: RewindInspection }
+  | { kind: 'working' }
   | { kind: 'error'; message: string }
 
-const STEP_KEYS: Record<RewindStep, string> = {
-  stopping: 'stopping', restoring: 'restoring', forking: 'forking', preparing: 'preparing', sending: 'sending',
-}
+export const isModified = (info: RewindInspection) => info.modified.turns + info.modified.edits > 0
 
-function describe(info: RewindInspection, running: boolean, mode: RewindMode, t: Translate): { text: string; tone?: 'warn' }[] {
-  const lines: { text: string; tone?: 'warn' }[] = [{ text: t(mode === 'retry' ? 'retryBody' : 'rewindBody') }]
-  if (!info.settings.restoreFiles) lines.push({ text: t('filesOff') })
-  else if (info.checkpoint === null) lines.push({ text: t('noCheckpoint'), tone: 'warn' })
-  else {
-    lines.push({ text: format(t('files'), { files: info.checkpoint.files }) })
-    if (info.checkpoint.truncated) lines.push({ text: t('truncated'), tone: 'warn' })
-    if (info.checkpoint.skipped > 0) lines.push({ text: format(t('skipped'), { count: info.checkpoint.skipped }), tone: 'warn' })
+/** The warning or confirmation lines for one inspection. */
+export function describe(info: RewindInspection, mode: RewindMode, t: Translate): { text: string; tone?: 'warn' }[] {
+  const lines: { text: string; tone?: 'warn' }[] = []
+  if (isModified(info)) {
+    const parts = [
+      info.modified.turns > 0 ? format(t('modifiedTurns'), { count: info.modified.turns }) : '',
+      info.modified.edits > 0 ? format(t('modifiedEdits'), { count: info.modified.edits }) : '',
+    ].filter(Boolean).join(t('listSeparator'))
+    lines.push({ text: format(t(mode === 'retry' ? 'modifiedRetry' : 'modifiedEdit'), { details: parts }), tone: 'warn' })
   }
-  const tooLarge = info.attachments.filter(attachment => !attachment.available).length
-  if (tooLarge > 0) lines.push({ text: format(t('attachmentsTooLarge'), { count: tooLarge }), tone: 'warn' })
-  if (running) lines.push({ text: t('running'), tone: 'warn' })
-  lines.push({ text: t(info.settings.archiveSource ? 'archive' : 'keepSource') })
+  if (info.laterMessages > 0) lines.push({ text: format(t('laterMessages'), { count: info.laterMessages }) })
+  else lines.push({ text: t(mode === 'retry' ? 'retryBody' : 'editBody') })
+  if (mode === 'edit') {
+    const tooLarge = info.attachments.filter(attachment => !attachment.available).length
+    if (tooLarge > 0) lines.push({ text: format(t('attachmentsTooLarge'), { count: tooLarge }), tone: 'warn' })
+  }
+  if (info.running) lines.push({ text: t('running'), tone: 'warn' })
   return lines
 }
 
 function noticeText(notice: RewindNotice, t: Translate): string {
   return format(t(notice.key), notice.values)
+}
+
+function refusalText(refusal: NonNullable<RewindInspection['refusal']>, t: Translate): string {
+  return t(`refusal.${refusal}`)
 }
 
 /**
@@ -79,7 +88,7 @@ export function RewindButton({ sessionId, seq, mode, face, side = 'bottom', onOp
   const panel = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
-    if (phase.kind !== 'confirm' && phase.kind !== 'error') return
+    if (phase.kind !== 'warn' && phase.kind !== 'confirm' && phase.kind !== 'error') return
     const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') setPhase({ kind: 'idle' }) }
     const onPointer = (event: PointerEvent) => {
       if (panel.current && event.target instanceof Node && !panel.current.parentElement?.contains(event.target)) setPhase({ kind: 'idle' })
@@ -89,33 +98,33 @@ export function RewindButton({ sessionId, seq, mode, face, side = 'bottom', onOp
     return () => { document.removeEventListener('keydown', onKey); document.removeEventListener('pointerdown', onPointer) }
   }, [phase.kind])
 
+  const fail = useCallback((error: unknown) => {
+    const message = format(t('failed'), { message: error instanceof Error ? error.message : String(error) })
+    if (alive.current) setPhase({ kind: 'error', message })
+    else console.warn('[dsh-message-rewind]', message)
+  }, [t])
+
+  const act = useCallback((info: RewindInspection, options: RewindOptions) => {
+    setPhase({ kind: 'working' })
+    controller.run(sessionId, info, mode, options).then(outcome => {
+      if (!alive.current) return
+      if (outcome.status === 'confirm') setPhase({ kind: 'warn', info: outcome.inspection })
+      else if (outcome.notices.length > 0) setPhase({ kind: 'error', message: outcome.notices.map(notice => noticeText(notice, t)).join('\n') })
+      else setPhase({ kind: 'idle' })
+    }, fail)
+  }, [controller, fail, mode, sessionId, t])
+
   const start = useCallback(() => {
     if (phase.kind !== 'idle') { if (phase.kind !== 'working') setPhase({ kind: 'idle' }); return }
     setPhase({ kind: 'loading' })
     controller.inspect(sessionId, seq).then(info => {
-      if (alive.current) setPhase({ kind: 'confirm', info, running: controller.isRunning(sessionId) })
-    }, error => {
-      if (alive.current) setPhase({ kind: 'error', message: format(t('failed'), { message: error instanceof Error ? error.message : String(error) }) })
-    })
-  }, [controller, phase.kind, sessionId, seq, t])
-
-  const confirm = useCallback((info: RewindInspection) => {
-    setPhase({ kind: 'working', step: 'forking' })
-    controller.run(sessionId, info, mode, step => { if (alive.current) setPhase({ kind: 'working', step }) }).then(outcome => {
-      const problems = outcome.notices.filter(notice => notice.key !== 'restoredFiles')
-      if (!alive.current) {
-        if (problems.length > 0) console.warn('[dsh-message-rewind]', problems.map(notice => noticeText(notice, t)).join('\n'))
-        return
-      }
-      if (problems.length > 0) setPhase({ kind: 'error', message: problems.map(notice => noticeText(notice, t)).join('\n') })
-      else setPhase({ kind: 'idle' })
-    }, error => {
-      const message = error instanceof Error && error.message === 'stop-timeout' ? t('stopTimeout')
-        : format(t('failed'), { message: error instanceof Error ? error.message : String(error) })
-      if (alive.current) setPhase({ kind: 'error', message })
-      else console.warn('[dsh-message-rewind]', message)
-    })
-  }, [controller, mode, sessionId, t])
+      if (!alive.current) return
+      if (info.refusal !== null) setPhase({ kind: 'error', message: refusalText(info.refusal, t) })
+      else if (isModified(info)) setPhase({ kind: 'warn', info })
+      else if (info.running || (mode === 'retry' && info.laterMessages > 0)) setPhase({ kind: 'confirm', info })
+      else act(info, { knownModified: false, note: null })
+    }, fail)
+  }, [act, controller, fail, mode, phase.kind, sessionId, seq, t])
 
   const label = t(mode === 'retry' ? 'retry' : 'rewind')
   const button = <button
@@ -128,34 +137,57 @@ export function RewindButton({ sessionId, seq, mode, face, side = 'bottom', onOp
     onClick={start}
   >{mode === 'retry' ? (face.RetryIcon ? <face.RetryIcon /> : <RefreshIcon />) : <UndoIcon />}</button>
 
+  const note = t(mode === 'retry' ? 'noteRetry' : 'noteEdit')
   return <span className="dmr-anchor">
     {face.Tooltip && !open ? <face.Tooltip label={label} side="bottom">{button}</face.Tooltip> : button}
-    {open && <div className="dmr-panel" data-side={side} role="dialog" aria-label={label} ref={panel}>
+    {open && <div className="dmr-panel" data-side={side} role="dialog" aria-label={label} ref={panel} data-phase={phase.kind}>
       {phase.kind === 'loading' && <p>{t('loading')}</p>}
-      {phase.kind === 'working' && <p role="status">{t(STEP_KEYS[phase.step])}</p>}
+      {phase.kind === 'working' && <p role="status">{t(mode === 'retry' ? 'sending' : 'preparing')}</p>}
       {phase.kind === 'error' && <>
         {phase.message.split('\n').map((line, index) => <p key={index} data-tone="error">{line}</p>)}
         <div className="dmr-buttons"><button type="button" className="dmr-button" onClick={() => setPhase({ kind: 'idle' })}>{t('close')}</button></div>
       </>}
-      {phase.kind === 'confirm' && <>
-        <h4>{t(mode === 'retry' ? 'retryTitle' : 'rewindTitle')}</h4>
-        {describe(phase.info, phase.running, mode, t).map((line, index) => <p key={index} data-tone={line.tone}>{line.text}</p>)}
+      {(phase.kind === 'warn' || phase.kind === 'confirm') && <>
+        <h4>{t(phase.kind === 'warn' ? 'warnTitle' : (mode === 'retry' ? 'retryTitle' : 'rewindTitle'))}</h4>
+        {describe(phase.info, mode, t).map((line, index) => <p key={index} data-tone={line.tone}>{line.text}</p>)}
+        {phase.kind === 'warn' && <p className="dmr-note">{format(t('noteHint'), { note })}</p>}
         <div className="dmr-buttons">
           <button type="button" className="dmr-button" onClick={() => setPhase({ kind: 'idle' })}>{t('cancel')}</button>
-          <button type="button" className="dmr-button" data-primary="" onClick={() => confirm(phase.info)}>
-            {t(mode === 'retry' ? 'confirmRetry' : 'confirmRewind')}
-          </button>
+          <button type="button" className="dmr-button" data-primary={phase.kind === 'confirm' ? '' : undefined}
+            onClick={() => act(phase.info, { knownModified: true, note: null })}>{t('confirm')}</button>
+          {phase.kind === 'warn' && <button type="button" className="dmr-button" data-primary=""
+            onClick={() => act(phase.info, { knownModified: true, note })}>{t('confirmWithNote')}</button>}
         </div>
       </>}
     </div>}
   </span>
 }
 
-/** The rewind row placed under one user message. */
+/** The rewind and regenerate row under one user message. */
 export function UserRewindActions({ sessionId, seq, face }: { sessionId: string; seq: number; face: RewindFace }) {
-  const [open, setOpen] = useState(false)
-  return <div className="dmr-user-actions" data-open={open || undefined}>
-    <RewindButton sessionId={sessionId} seq={seq} mode="edit" face={face} onOpenChange={setOpen} />
+  const [editOpen, setEditOpen] = useState(false)
+  const [retryOpen, setRetryOpen] = useState(false)
+  return <div className="dmr-user-actions" data-open={editOpen || retryOpen || undefined}>
+    <RewindButton sessionId={sessionId} seq={seq} mode="retry" face={face} onOpenChange={setRetryOpen} />
+    <RewindButton sessionId={sessionId} seq={seq} mode="edit" face={face} onOpenChange={setEditOpen} />
+  </div>
+}
+
+/** Shown in place of a message whose edit is pending in the composer. */
+export function ArmedNotice({ sessionId, face }: { sessionId: string; face: RewindFace }) {
+  const [error, setError] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  const undo = () => {
+    setBusy(true)
+    face.controller.undo(sessionId).then(() => setBusy(false), error => {
+      setBusy(false)
+      setError(format(face.t('failed'), { message: error instanceof Error ? error.message : String(error) }))
+    })
+  }
+  return <div className="dmr-armed" role="status">
+    <span>{face.t('armed')}</span>
+    <button type="button" className="dmr-button" disabled={busy} onClick={undo}>{face.t('undoRewind')}</button>
+    {error && <span data-tone="error">{error}</span>}
   </div>
 }
 
@@ -170,7 +202,7 @@ export interface ChatSnapshotLike {
  * The latest human message of the last Turn, when `messageId` closes that Turn.
  * @param snapshot - Chat snapshot.
  * @param messageId - assistant message the action strip belongs to.
- * @returns the message seq to rewind to, or null.
+ * @returns the message seq to regenerate from, or null.
  */
 export function retryTarget(snapshot: ChatSnapshotLike, messageId: string): number | null {
   const last = snapshot.timeline?.turnOrder?.at(-1)
