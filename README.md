@@ -99,10 +99,12 @@ npm install
 npm run build   # tsc + 浏览器构建 lib/client.js
 npm run check
 npm test
-npm run release   # 构建、测试，生成本地 release 提交和 v<版本> 标签（不推送）
+npm run release   # 本地生成 release 提交和 v<版本> 标签（不推送；正常发版由 Actions 完成）
 ```
 
-发版：递增 `package.json` 版本并提交源码，再运行 `npm run release`。脚本用临时索引生成发布提交，不改工作区和当前分支；发布提交挂在 `release` 分支上，父提交是上一个发布提交和本次源码提交。推送 `master`、`release` 和标签后，用脚本输出的 `github:` 来源安装。
+发版由 GitHub Actions（`.github/workflows/release.yml`）完成：递增 `package.json` 版本并提交，推送 `master`。workflow 按 lockfile `npm ci`，发现 `v<版本>` 标签还不存在时运行 `scripts/release.mjs`：构建、测试，用临时索引生成带 `lib/`、去掉 `prepare` 的发布提交，挂在 `release` 分支上（父提交是上一个发布提交和本次源码提交）并打标签，再推送分支和标签。安装来源写在该次运行的摘要里，也可以取 `v<版本>` 标签指向的提交。版本号没变的推送只构建和测试。
+
+`npm run release` 也可以在本地生成同样的发布提交（不推送），用于 Actions 不可用时手动发版。
 
 测试覆盖的内容：
 

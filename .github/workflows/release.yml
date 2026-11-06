@@ -1,0 +1,66 @@
+# Builds and tests every push to master. When package.json carries a version
+# that has no v<version> tag yet, it also publishes a prebuilt release:
+# scripts/release.mjs commits the built lib/ (with `prepare` removed) onto the
+# `release` branch and tags it, and this job pushes both. Installing that
+# commit with github:<owner>/<repo>#<sha> needs no devDependencies or build.
+name: release
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Decide whether this version is new
+        id: version
+        run: |
+          version=$(node -p "require('./package.json').version")
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          if git rev-parse --quiet --verify "refs/tags/v$version" >/dev/null; then
+            echo "new=false" >> "$GITHUB_OUTPUT"
+            echo "v$version is already released; building and testing only." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # npm ci runs `prepare`, which builds lib/.
+      - run: npm ci
+
+      - name: Check and test
+        if: steps.version.outputs.new == 'false'
+        run: |
+          npm run check
+          npm test
+
+      - name: Create the release commit
+        if: steps.version.outputs.new == 'true'
+        run: |
+          if git ls-remote --exit-code --heads origin release >/dev/null; then
+            git fetch --no-tags origin release:release
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          node scripts/release.mjs
+
+      - name: Push the release branch and tag
+        if: steps.version.outputs.new == 'true'
+        run: git push --atomic origin refs/heads/release "refs/tags/${{ steps.version.outputs.tag }}"
