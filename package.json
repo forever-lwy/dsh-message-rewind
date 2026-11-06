@@ -1,7 +1,7 @@
 {
   "name": "dsh-message-rewind",
-  "version": "0.2.0",
-  "description": "Rewind a DSH rc.5 conversation in place to any user message (edit it with its images and files) or regenerate a reply; warns when the withdrawn turns modified workspace files",
+  "version": "0.2.1",
+  "description": "Rewind a DSH conversation in place to any user message (edit it with its images and files) or regenerate a reply; warns when the withdrawn turns modified workspace files",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -19,7 +19,7 @@
   "license": "MIT",
   "engines": {
     "node": ">=22.13",
-    "dsh": "0.2.1-rc.5"
+    "dsh": "*"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/build-client.mjs",
@@ -28,28 +28,34 @@
     "prepare": "npm run build"
   },
   "dependencies": {
-    "@deepseek-ai/schemastery": "~3.18.5",
     "zod": "4.4.3"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "~4.0.5",
-    "@deepseek-ai/dsh-attachment": "0.2.1-rc.5",
-    "@deepseek-ai/dsh-session": "0.2.1-rc.5",
-    "@deepseek-ai/dsh-typert-protocol": "0.2.1-rc.5",
-    "@deepseek-ai/dsh-agent": "0.2.1-rc.5"
+    "@deepseek-ai/cordis": ">=4.0.5 <5.0.0",
+    "@deepseek-ai/dsh-agent": ">=0.2.1-rc.5",
+    "@deepseek-ai/dsh-attachment": ">=0.2.1-rc.5",
+    "@deepseek-ai/dsh-session": ">=0.2.1-rc.5",
+    "@deepseek-ai/dsh-typert-protocol": ">=0.2.1-rc.5",
+    "@deepseek-ai/schemastery": ">=3.18.5 <4.0.0"
   },
   "devDependencies": {
-    "@deepseek-ai/dsh-api-remote-access": "0.2.1-rc.5",
-    "@deepseek-ai/dsh-api-session-controller": "0.2.1-rc.5",
-    "@deepseek-ai/dsh-app-boot": "0.2.1-rc.5",
-    "@deepseek-ai/dsh-base": "0.2.1-rc.5",
-    "@deepseek-ai/dsh-client-locale": "0.2.1-rc.5",
-    "@deepseek-ai/dsh-client-store": "0.2.1-rc.5",
-    "@deepseek-ai/dsh-client-ui-chat": "0.2.1-rc.5",
-    "@deepseek-ai/dsh-client-ui-conversation": "0.2.1-rc.5",
-    "@deepseek-ai/dsh-client-ui-slots": "0.2.1-rc.5",
-    "@deepseek-ai/dsh-typert-registry": "0.2.1-rc.5",
-    "@deepseek-ai/dsh-web-app": "0.2.1-rc.5",
+    "@deepseek-ai/cordis": "~4.1.0",
+    "@deepseek-ai/dsh-agent": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-api-remote-access": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-api-session-controller": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-app-boot": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-attachment": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-base": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-client-locale": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-client-store": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-client-ui-chat": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-client-ui-conversation": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-client-ui-slots": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-session": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-typert-protocol": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-typert-registry": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-web-app": "0.2.2-rc.1",
+    "@deepseek-ai/schemastery": "~3.19.0",
     "@types/node": "^24.0.0",
     "@types/react": "^18.3.0",
     "@types/react-dom": "^18.3.0",

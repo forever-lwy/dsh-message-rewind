@@ -1,6 +1,6 @@
 # DSH 消息回退
 
-适用于 **DeepSeek Harness 0.2.1-rc.5** 的消息增强插件，用来替代 dsh-rewind-plugin 和 dsh-redo：
+适用于 **DeepSeek Harness**（当前在 `0.2.2-rc.1` 上构建测试，不按 dsh 版本拦截加载） 的消息增强插件，用来替代 dsh-rewind-plugin 和 dsh-redo：
 
 - **用户消息下的“回退并编辑”**：对话回到这条消息发出之前，这条消息的文字、图片和文件回到输入框，可修改后再发送。
 - **用户消息下的“从此消息重新生成”**：撤回这条消息之后的对话，用原消息（含图片和文件）重新生成。
@@ -64,7 +64,7 @@ rc.5 的用户消息行没有可供插件追加按钮的扩展槽位。插件以
 开发源码与运行副本分离。版本包：
 
 ```text
-/plugins/releases/dsh-message-rewind-0.2.0.tgz
+/plugins/releases/dsh-message-rewind-0.2.1.tgz
 ```
 
 在 dsh「插件 → 添加插件」输入上面的**容器路径**，确认安装并启用。是否需要重启以安装界面提示为准。不要用 `link:`、目录依赖或模块路径把源码目录接入常用 profile。

@@ -16,18 +16,18 @@ function officialLayers() {
   return ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'].flatMap(name => {
     const path = require.resolve(name + '/package.json')
     const pkg = JSON.parse(readFileSync(path, 'utf8'))
-    assert.equal(pkg.version, '0.2.1-rc.5')
+    assert.equal(pkg.version, '0.2.2-rc.1')
     return [].concat(pkg.dsh.bundle.patch).map(patch => loadOverlayPatches('message-rewind-test', resolve(dirname(path), patch)))
   })
 }
 
-test('manifest declares the bundle patch, both entries, and the exact rc.5 range', () => {
+test('manifest declares the bundle patch, both entries, and no dsh version gate', () => {
   assert.equal(manifest.dsh.bundle.patch, './cordis.patch.yml')
-  assert.equal(manifest.engines.dsh, '0.2.1-rc.5')
+  assert.equal(manifest.engines.dsh, '*', 'never gate on the dsh version')
   assert.equal(manifest.exports['./client'], './lib/client.js')
   assert.equal(manifest.dsh.client.platform, 'web')
   for (const peer of Object.keys(manifest.peerDependencies).filter(name => name.startsWith('@deepseek-ai/dsh-'))) {
-    assert.equal(manifest.peerDependencies[peer], '0.2.1-rc.5', peer)
+    assert.match(manifest.peerDependencies[peer], /^>=/, peer)
   }
   assert.ok(manifest.files.includes('lib') && manifest.files.includes('cordis.patch.yml'))
 })
