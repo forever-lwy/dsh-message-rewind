@@ -61,15 +61,17 @@ rc.5 的用户消息行没有可供插件追加按钮的扩展槽位。插件以
 
 ## 安装
 
-开发源码与运行副本分离。版本包：
+从 GitHub 的预构建发布提交安装。发布提交已带构建好的 `lib/` 且去掉了 `prepare`，安装时不装 devDependencies、不构建。在 dsh「插件 → 添加插件」输入固定到完整 SHA 的来源（每个版本的 SHA 见 `release` 分支或 `v<版本>` 标签），确认安装并启用：
 
 ```text
-/plugins/releases/forever-lwy-dsh-message-rewind-0.2.2.tgz
+github:forever-lwy/dsh-message-rewind#<release 提交的完整 SHA>
 ```
 
-在 dsh「插件 → 添加插件」输入上面的**容器路径**，确认安装并启用。
+不要安装 `master`：源码分支不含 `lib/`，安装时会靠 `prepare` 拉全部 devDependencies 现场构建，很慢。dshmarket 按发布提交里 `package.json` 的版本号判断是否有更新。
 
-包名自 0.2.2 起为 `@forever-lwy/dsh-message-rewind`。npm 与插件市场目录里已有他人发布的同名包 `dsh-message-rewind`，旧包名会被市场当成那个插件并提示“可更新”。从 0.2.1 及更早版本迁移时，先卸载旧的 `dsh-message-rewind`，再安装新包；两者注册同一个 `message-rewind` 宿主行，不能同时安装。是否需要重启以安装界面提示为准。不要用 `link:`、目录依赖或模块路径把源码目录接入常用 profile。
+包名自 0.2.2 起为 `@forever-lwy/dsh-message-rewind`。npm 与插件市场目录里已有他人发布的同名包 `dsh-message-rewind`，旧包名会被市场当成那个插件并提示“可更新”。从 0.2.1 及更早版本迁移时，先卸载旧的 `dsh-message-rewind`，再安装新包；两者注册同一个 `message-rewind` 宿主行，不能同时安装。
+
+是否需要重启以安装界面提示为准。不要用 `link:`、目录依赖或模块路径把源码目录接入常用 profile。
 
 ## 设置
 
@@ -97,7 +99,10 @@ npm install
 npm run build   # tsc + 浏览器构建 lib/client.js
 npm run check
 npm test
+npm run release   # 构建、测试，生成本地 release 提交和 v<版本> 标签（不推送）
 ```
+
+发版：递增 `package.json` 版本并提交源码，再运行 `npm run release`。脚本用临时索引生成发布提交，不改工作区和当前分支；发布提交挂在 `release` 分支上，父提交是上一个发布提交和本次源码提交。推送 `master`、`release` 和标签后，用脚本输出的 `github:` 来源安装。
 
 测试覆盖的内容：
 

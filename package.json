@@ -1,6 +1,6 @@
 {
   "name": "@forever-lwy/dsh-message-rewind",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Rewind a DSH conversation in place to any user message (edit it with its images and files) or regenerate a reply; warns when the withdrawn turns modified workspace files",
   "type": "module",
   "main": "lib/index.js",
@@ -17,6 +17,10 @@
     "LICENSE"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/forever-lwy/dsh-message-rewind.git"
+  },
   "engines": {
     "node": ">=22.13",
     "dsh": "*"
@@ -25,7 +29,8 @@
     "build": "tsc -p tsconfig.json && node scripts/build-client.mjs",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "node --test --test-isolation=none test/*.test.mjs",
-    "prepare": "npm run build"
+    "prepare": "npm run build",
+    "release": "node scripts/release.mjs"
   },
   "dependencies": {
     "zod": "4.4.3"
