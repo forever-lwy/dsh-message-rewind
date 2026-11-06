@@ -64,10 +64,12 @@ rc.5 的用户消息行没有可供插件追加按钮的扩展槽位。插件以
 开发源码与运行副本分离。版本包：
 
 ```text
-/plugins/releases/dsh-message-rewind-0.2.1.tgz
+/plugins/releases/forever-lwy-dsh-message-rewind-0.2.2.tgz
 ```
 
-在 dsh「插件 → 添加插件」输入上面的**容器路径**，确认安装并启用。是否需要重启以安装界面提示为准。不要用 `link:`、目录依赖或模块路径把源码目录接入常用 profile。
+在 dsh「插件 → 添加插件」输入上面的**容器路径**，确认安装并启用。
+
+包名自 0.2.2 起为 `@forever-lwy/dsh-message-rewind`。npm 与插件市场目录里已有他人发布的同名包 `dsh-message-rewind`，旧包名会被市场当成那个插件并提示“可更新”。从 0.2.1 及更早版本迁移时，先卸载旧的 `dsh-message-rewind`，再安装新包；两者注册同一个 `message-rewind` 宿主行，不能同时安装。是否需要重启以安装界面提示为准。不要用 `link:`、目录依赖或模块路径把源码目录接入常用 profile。
 
 ## 设置
 

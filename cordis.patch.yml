@@ -5,4 +5,4 @@
 # from the Plugins page.
 - insert:
     - id: message-rewind
-      name: dsh-message-rewind
+      name: '@forever-lwy/dsh-message-rewind'

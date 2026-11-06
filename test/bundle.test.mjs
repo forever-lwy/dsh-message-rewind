@@ -39,7 +39,7 @@ test('the patch adds one root row beside workspace-changes and changes no offici
   const after = composeEntries([...layers, loadOverlayPatches('message-rewind-test', resolve(project, 'cordis.patch.yml'))], message => warnings.push(message))
   assert.deepEqual(warnings, [])
   const added = after.filter(row => !before.some(other => other.id === row.id))
-  assert.deepEqual(added.map(row => [row.id, row.name]), [['message-rewind', 'dsh-message-rewind']])
+  assert.deepEqual(added.map(row => [row.id, row.name]), [['message-rewind', '@forever-lwy/dsh-message-rewind']])
   assert.ok(after.some(row => row.id === 'workspace-changes'), 'the official recorder stays a sibling root row')
   for (const row of before) assert.deepEqual(after.find(other => other.id === row.id), row)
 })

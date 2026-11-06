@@ -70,7 +70,7 @@ const method = (input: z.ZodType, output: z.ZodType) => ({
   result: codec(output, 'MessageRewindResult'), cancellation: { parameter: 'signal' as const },
 })
 
-export const remoteInfo = createTypertRemoteInfo({ package: 'dsh-message-rewind', methods: {
+export const remoteInfo = createTypertRemoteInfo({ package: '@forever-lwy/dsh-message-rewind', methods: {
   'messageRewind/inspect': method(targetSchema, inspectionSchema),
   'messageRewind/attachment': method(attachmentRequestSchema, attachmentDataSchema),
   'messageRewind/arm': method(armSchema, armResultSchema),

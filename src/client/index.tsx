@@ -27,7 +27,7 @@ import { styles } from './styles.js'
 export const name = 'dsh-message-rewind-client'
 export const inject = ['slots', 'locale', 'remote']
 
-const PACKAGE = 'dsh-message-rewind'
+const PACKAGE = '@forever-lwy/dsh-message-rewind'
 const namespace = 'messageRewind'
 /** Below the official renderer's default priority 0, so this entry wins its cell. */
 const SHADOW_PRIORITY = -10

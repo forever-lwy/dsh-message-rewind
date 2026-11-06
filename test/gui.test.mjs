@@ -23,7 +23,7 @@ const modules = {
     IconRefreshOutlineRegular: () => React.createElement('svg', { 'data-icon': 'refresh' }),
   },
 }
-window.__ModuleLoader__ = { load: ({ id, factory }) => { assert.equal(id, 'dsh-message-rewind'); client = factory(name => {
+window.__ModuleLoader__ = { load: ({ id, factory }) => { assert.equal(id, '@forever-lwy/dsh-message-rewind'); client = factory(name => {
   if (!(name in modules)) throw new Error(`unexpected require ${name}`)
   return modules[name]
 }) } }
@@ -228,7 +228,7 @@ test('apply mounts the remote, shadows user/steering renderers below the officia
     ['conversation.chat.node', 'steering', -10, 'chat'],
     ['conversation.chat.assistant-actions', 'message-rewind.retry', undefined, undefined],
   ])
-  assert.ok(document.head.querySelector('style[data-plugin="dsh-message-rewind"]'))
+  assert.ok(document.head.querySelector('style[data-plugin="@forever-lwy/dsh-message-rewind"]'))
   for (const dispose of effects) if (typeof dispose === 'function') dispose()
-  assert.equal(document.head.querySelector('style[data-plugin="dsh-message-rewind"]'), null)
+  assert.equal(document.head.querySelector('style[data-plugin="@forever-lwy/dsh-message-rewind"]'), null)
 })
