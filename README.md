@@ -67,7 +67,7 @@ rc.5 的用户消息行没有可供插件追加按钮的扩展槽位。插件以
 github:forever-lwy/dsh-message-rewind#<release 提交的完整 SHA>
 ```
 
-不要安装 `master`：源码分支不含 `lib/`，安装时会靠 `prepare` 拉全部 devDependencies 现场构建，很慢。dshmarket 按发布提交里 `package.json` 的版本号判断是否有更新。
+不要安装 `master`：源码分支不含 `lib/`，安装时会靠 `prepare` 拉全部 devDependencies 现场构建，很慢。仓库默认分支设为 `release`：dshmarket 对固定 SHA 的安装按默认分支上 `package.json` 的版本号判断是否有更新，点击更新时安装默认分支的最新提交。
 
 包名自 0.2.2 起为 `@forever-lwy/dsh-message-rewind`。npm 与插件市场目录里已有他人发布的同名包 `dsh-message-rewind`，旧包名会被市场当成那个插件并提示“可更新”。从 0.2.1 及更早版本迁移时，先卸载旧的 `dsh-message-rewind`，再安装新包；两者注册同一个 `message-rewind` 宿主行，不能同时安装。
 
