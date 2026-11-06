@@ -1,20 +1,20 @@
-# Builds and tests every push to master. When package.json carries a version
-# that has no v<version> tag yet, it also publishes a prebuilt release:
-# scripts/release.mjs commits the built lib/ (with `prepare` removed) onto the
-# `release` branch and tags it, and this job pushes both. Installing that
-# commit with github:<owner>/<repo>#<sha> needs no devDependencies or build.
+# Runs only when a v<version> tag is pushed; pushes to master trigger nothing.
+# It builds and tests the tagged commit, then scripts/release.mjs records a
+# prebuilt commit (the same tree plus lib/, with `prepare` removed) whose
+# parent is the tagged commit, and this job pushes it as dist/v<version>.
+# Installing github:<owner>/<repo>#dist/v<version> needs no devDependencies
+# or build. No branch is created.
 name: release
 
 on:
   push:
-    branches: [master]
-  workflow_dispatch:
+    tags: ['v*']
 
 permissions:
   contents: write
 
 concurrency:
-  group: release
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -30,37 +30,22 @@ jobs:
           node-version: 24
           cache: npm
 
-      - name: Decide whether this version is new
-        id: version
+      - name: Check the tag matches package.json
         run: |
           version=$(node -p "require('./package.json').version")
-          echo "tag=v$version" >> "$GITHUB_OUTPUT"
-          if git rev-parse --quiet --verify "refs/tags/v$version" >/dev/null; then
-            echo "new=false" >> "$GITHUB_OUTPUT"
-            echo "v$version is already released; building and testing only." >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "new=true" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package.json version $version"
+            exit 1
           fi
 
-      # npm ci runs `prepare`, which builds lib/.
+      # npm ci runs `prepare`; release.mjs rebuilds lib/ from scratch anyway.
       - run: npm ci
 
-      - name: Check and test
-        if: steps.version.outputs.new == 'false'
+      - name: Build, test and create the dist commit
         run: |
-          npm run check
-          npm test
-
-      - name: Create the release commit
-        if: steps.version.outputs.new == 'true'
-        run: |
-          if git ls-remote --exit-code --heads origin release >/dev/null; then
-            git fetch --no-tags origin release:release
-          fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           node scripts/release.mjs
 
-      - name: Push the release branch and tag
-        if: steps.version.outputs.new == 'true'
-        run: git push --atomic origin refs/heads/release "refs/tags/${{ steps.version.outputs.tag }}"
+      - name: Push the dist tag
+        run: git push origin "refs/tags/dist/$GITHUB_REF_NAME"

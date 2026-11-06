@@ -1,25 +1,26 @@
-// Prepare a prebuilt GitHub release commit for the version in package.json.
+// Prepare the prebuilt commit for a release tag.
 //
-// The source branch never carries lib/; it is built at install time only when
-// a `prepare` script exists, which makes pnpm install every devDependency
-// first. A release commit instead holds the built lib/ and drops `prepare`,
-// so `github:<owner>/<repo>#<sha>` installs like a registry tarball: no
-// devDependencies, no build, no build approval.
+// Releases are cut by tagging a source commit `v<version>` (matching
+// package.json). The source never carries lib/; installing it from GitHub
+// would run `prepare`, which makes pnpm install every devDependency and build.
+// This script builds and tests the tagged commit, then records a prebuilt
+// commit — the same tree plus lib/, with `prepare` removed — whose only parent
+// is the source commit, and tags it `dist/v<version>`. No branch is created
+// or moved; the commit is reachable through that tag alone. Installing
+// `github:<owner>/<repo>#dist/v<version>` needs no devDependencies or build.
 //
 // The commit is made with plumbing (a temporary index), so the working tree
-// and the current branch are left untouched. It lands on `release` (parents:
-// the previous release and the source commit) and is tagged `v<version>`.
-// Nothing is pushed; .github/workflows/release.yml runs this on master and
-// pushes the result.
+// and the current branch are left untouched. Nothing is pushed;
+// .github/workflows/release.yml runs this for each pushed v* tag and pushes
+// the dist tag.
 //
-//   node scripts/release.mjs
+//   git tag v<version> && node scripts/release.mjs
 import { execFileSync } from 'node:child_process'
 import { appendFileSync, existsSync, readFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
-const RELEASE_BRANCH = 'refs/heads/release'
 const run = (command, args, options = {}) =>
   execFileSync(command, args, { cwd: root, encoding: 'utf8', stdio: ['pipe', 'pipe', 'inherit'], ...options }).trim()
 const git = (args, options) => run('git', args, options)
@@ -30,7 +31,11 @@ if (git(['status', '--porcelain']) !== '') fail('working tree is not clean; comm
 const source = git(['rev-parse', 'HEAD'])
 const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
 const tag = `v${manifest.version}`
-if (tryGit(['rev-parse', '--verify', '--quiet', `refs/tags/${tag}`]) !== null) fail(`tag ${tag} already exists; bump the version`)
+const distTag = `dist/${tag}`
+const tagged = tryGit(['rev-parse', '--verify', '--quiet', `refs/tags/${tag}^{commit}`])
+if (tagged === null) fail(`tag ${tag} does not exist; tag the source commit first`)
+if (tagged !== source) fail(`tag ${tag} points at ${tagged}, not HEAD ${source}; check out the tag (package.json says ${manifest.version})`)
+if (tryGit(['rev-parse', '--verify', '--quiet', `refs/tags/${distTag}`]) !== null) fail(`${distTag} already exists`)
 const repository = typeof manifest.repository === 'string' ? manifest.repository : manifest.repository?.url
 const repo = /github\.com[/:]([^/]+\/[^/.]+)/.exec(repository ?? '')?.[1] ?? /^github:([^/]+\/[^#]+)$/.exec(repository ?? '')?.[1]
 if (repo === undefined) fail('package.json needs a GitHub repository field')
@@ -59,18 +64,15 @@ try {
   const blob = withIndex(['hash-object', '-w', '--stdin'], `${JSON.stringify(released, null, 2)}\n`)
   withIndex(['update-index', '--cacheinfo', `100644,${blob},package.json`])
   const tree = withIndex(['write-tree'])
-  const previous = tryGit(['rev-parse', '--verify', '--quiet', RELEASE_BRANCH])
-  const parents = [...(previous === null ? [] : ['-p', previous]), '-p', source]
-  const commit = withIndex(['commit-tree', tree, ...parents, '-m', `release: ${tag}\n\nPrebuilt from ${source}.`])
-  git(['update-ref', RELEASE_BRANCH, commit, ...(previous === null ? [] : [previous])], { env })
-  git(['tag', tag, commit], { env })
-  const install = `github:${repo}#${commit}`
-  console.log(`\nrelease ${tag}\n  source  ${source}\n  release ${commit}\n  install ${install}`)
-  // In GitHub Actions: expose the commit and show the install source on the run page.
-  if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `commit=${commit}\ninstall=${install}\n`)
+  const commit = withIndex(['commit-tree', tree, '-p', source, '-m', `dist: ${tag}\n\nPrebuilt from ${source}.`])
+  git(['tag', distTag, commit], { env })
+  const install = `github:${repo}#${distTag}`
+  console.log(`\nrelease ${tag}\n  source  ${source}\n  dist    ${commit} (${distTag})\n  install ${install}`)
+  // In GitHub Actions: expose the result and show the install source on the run page.
+  if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `commit=${commit}\ndist-tag=${distTag}\ninstall=${install}\n`)
   if (process.env.GITHUB_STEP_SUMMARY) {
     appendFileSync(process.env.GITHUB_STEP_SUMMARY,
-      `## ${manifest.name} ${tag}\n\n- source: \`${source}\`\n- release: \`${commit}\`\n\nInstall:\n\n\`\`\`text\n${install}\n\`\`\`\n`)
+      `## ${manifest.name} ${tag}\n\n- source: \`${source}\`\n- dist: \`${commit}\` (\`${distTag}\`)\n\nInstall:\n\n\`\`\`text\n${install}\n\`\`\`\n`)
   }
 } finally {
   rmSync(env.GIT_INDEX_FILE, { force: true })
