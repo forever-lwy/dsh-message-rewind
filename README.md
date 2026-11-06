@@ -61,13 +61,13 @@ rc.5 的用户消息行没有可供插件追加按钮的扩展槽位。插件以
 
 ## 安装
 
-从 GitHub 的预构建提交安装：每个版本有一个 `dist/v<版本>` 标签，指向带构建好的 `lib/`、去掉了 `prepare` 的提交，安装时不装 devDependencies、不构建。在 dsh「插件 → 添加插件」输入来源，确认安装并启用：
+在 dsh「插件 → 添加插件」输入下面的来源，确认安装并启用：
 
 ```text
-github:forever-lwy/dsh-message-rewind#dist/v0.2.3
+github:forever-lwy/dsh-message-rewind
 ```
 
-不要安装 `master` 或 `v<版本>` 标签：它们是源码，不含 `lib/`，安装时会靠 `prepare` 拉全部 devDependencies 现场构建，很慢。按标签安装时 dshmarket 不提示更新，升级时安装新版本的 `dist/v<版本>`。
+仓库默认分支是 `release`，其中每个提交都是某次发版的源码加上构建好的 `lib/`，并去掉了 `prepare`，所以安装时不装 devDependencies、不构建。dshmarket 按默认分支上 `package.json` 的版本号判断是否有更新，点击更新时安装 `release` 的最新提交。不要安装 `master`：它只有源码，安装时会靠 `prepare` 拉全部 devDependencies 现场构建，很慢。
 
 包名自 0.2.2 起为 `@forever-lwy/dsh-message-rewind`。npm 与插件市场目录里已有他人发布的同名包 `dsh-message-rewind`，旧包名会被市场当成那个插件并提示“可更新”。从 0.2.1 及更早版本迁移时，先卸载旧的 `dsh-message-rewind`，再安装新包；两者注册同一个 `message-rewind` 宿主行，不能同时安装。
 
@@ -99,12 +99,12 @@ npm install
 npm run build   # tsc + 浏览器构建 lib/client.js
 npm run check
 npm test
-npm run release   # 对已打 v<版本> 标签的 HEAD 本地生成 dist 提交和标签（不推送；正常发版由 Actions 完成）
+npm run release   # 对已打 v<版本> 标签的 HEAD 本地生成 release 提交（不推送；正常发版由 Actions 完成）
 ```
 
-发版：在 `master` 上开发和推送不会触发任何构建。改完后递增 `package.json` 版本并提交，打同名标签并推送，例如 `git tag v0.2.4 && git push origin master v0.2.4`。GitHub Actions（`.github/workflows/release.yml`）只在 `v*` 标签推送时运行：检查标签与版本一致，按 lockfile `npm ci`，由 `scripts/release.mjs` 构建、测试，用临时索引生成带 `lib/`、去掉 `prepare` 的提交（唯一父提交是该源码提交），打 `dist/v<版本>` 标签并推送。不创建分支。安装来源写在该次运行的摘要里。
+发版：在 `master` 上开发和推送不会触发任何构建。改完后递增 `package.json` 版本并提交，打同名标签并推送，例如 `git tag v0.2.4 && git push origin master v0.2.4`。GitHub Actions（`.github/workflows/release.yml`）只在 `v*` 标签推送时运行：检查标签与版本一致，按 lockfile `npm ci`，由 `scripts/release.mjs` 构建、测试，在 `release` 分支上追加一个发布提交（源码加 `lib/`，去掉 `prepare`；父提交是上一个发布提交和该标签的源码提交）并推送。`release` 已有同一或更高版本时会拒绝发版。
 
-`npm run release` 也可以在本地对已打标签的提交生成同样的 dist 提交（不推送），用于 Actions 不可用时手动发版。
+`npm run release` 也可以在本地对已打标签的提交生成同样的发布提交（不推送），用于 Actions 不可用时手动发版。
 
 测试覆盖的内容：
 

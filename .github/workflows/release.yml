@@ -1,9 +1,10 @@
 # Runs only when a v<version> tag is pushed; pushes to master trigger nothing.
-# It builds and tests the tagged commit, then scripts/release.mjs records a
-# prebuilt commit (the same tree plus lib/, with `prepare` removed) whose
-# parent is the tagged commit, and this job pushes it as dist/v<version>.
-# Installing github:<owner>/<repo>#dist/v<version> needs no devDependencies
-# or build. No branch is created.
+# It builds and tests the tagged master commit, then scripts/release.mjs adds
+# the next commit to the `release` branch: the same tree plus the built lib/,
+# with `prepare` removed, whose parents are the previous release commit and
+# the tagged commit. `release` is the default branch, so
+# github:<owner>/<repo> installs the latest release without devDependencies
+# or a build.
 name: release
 
 on:
@@ -14,7 +15,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 jobs:
@@ -41,11 +42,14 @@ jobs:
       # npm ci runs `prepare`; release.mjs rebuilds lib/ from scratch anyway.
       - run: npm ci
 
-      - name: Build, test and create the dist commit
+      - name: Build, test and create the release commit
         run: |
+          if git ls-remote --exit-code --heads origin release >/dev/null; then
+            git fetch --no-tags origin release:release
+          fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           node scripts/release.mjs
 
-      - name: Push the dist tag
-        run: git push origin "refs/tags/dist/$GITHUB_REF_NAME"
+      - name: Push the release branch
+        run: git push origin refs/heads/release
