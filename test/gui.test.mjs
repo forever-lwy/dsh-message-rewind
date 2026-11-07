@@ -228,6 +228,9 @@ test('apply mounts the remote, shadows user/steering renderers below the officia
     ['conversation.chat.node', 'steering', -10, 'chat'],
     ['conversation.chat.assistant-actions', 'message-rewind.retry', undefined, undefined],
   ])
+  // The user shadow declares the chain mirror its official bubble renders through; steering renders none.
+  assert.deepEqual(registrations[0].options.children, { 'dsh-message-rewind.user.before': { kind: 'chain', scope: 'session' } })
+  assert.equal(registrations[1].options.inject().renderSlotChain(), null)
   assert.ok(document.head.querySelector('style[data-plugin="@forever-lwy/dsh-message-rewind"]'))
   for (const dispose of effects) if (typeof dispose === 'function') dispose()
   assert.equal(document.head.querySelector('style[data-plugin="@forever-lwy/dsh-message-rewind"]'), null)

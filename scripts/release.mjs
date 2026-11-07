@@ -55,8 +55,10 @@ if (previous !== null) {
 rmSync(join(root, 'lib'), { recursive: true, force: true })
 execFileSync('npm', ['run', 'build'], { cwd: root, stdio: 'inherit' })
 execFileSync('npm', ['test'], { cwd: root, stdio: 'inherit' })
-for (const file of [manifest.main, ...Object.values(manifest.exports ?? {})]) {
-  if (typeof file === 'string' && file.startsWith('./lib/') && !existsSync(join(root, file))) fail(`missing build output ${file}`)
+const targets = (value) => typeof value === 'string' ? [value]
+  : value !== null && typeof value === 'object' ? Object.values(value).flatMap(targets) : []
+for (const file of [manifest.main, ...targets(manifest.exports)]) {
+  if (typeof file === 'string' && /^(\.\/)?lib\//.test(file) && !existsSync(join(root, file))) fail(`missing build output ${file}`)
 }
 if (git(['status', '--porcelain']) !== '') fail('build or tests changed tracked files')
 
