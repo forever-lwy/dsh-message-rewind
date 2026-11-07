@@ -3,11 +3,14 @@
  * regenerate button in the latest reply's action strip, and the stylesheet
  * that hides what a rewind withdrew.
  *
- * rc.5 offers no action slot on user messages, so this plugin shadows the
+ * DSH offers no action slot on user messages, so this plugin shadows the
  * official `user`/`steering` Chat Node renderers at a lower priority and
- * renders the current official renderer unchanged above its own row; the
- * official entry is looked up at render time, so it follows HMR and stays the
- * owner of the bubble itself.
+ * renders the current official renderer above its own row; the official entry
+ * is looked up at render time, so it follows HMR and stays the owner of the
+ * bubble itself. Since 0.2.2 the bubble needs a `renderSlotChain` for
+ * `conversation.chat.user.before`, which the renderer gives only to that
+ * slot's declarer; the shadow declares a mirror of it instead (renderers.tsx).
+ * A shadow that throws while rendering is retired from its cell until reload.
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
@@ -20,7 +23,7 @@ import { bindRemote, remoteInfo } from '../remote.js'
 import { RewindController, type RewindDeps } from './controller.js'
 import type { RewindFace } from './components.js'
 import { FeedRegistry, SessionFeed } from './feed.js'
-import { NODE_SLOT, createRetryAction, createUserNodeRenderer, type SlotsLike } from './renderers.js'
+import { createRetryAction, createUserNodeRenderer, registerUserNodes, type SlotsLike } from './renderers.js'
 import { en, zh } from './locales.js'
 import { styles } from './styles.js'
 
@@ -35,7 +38,7 @@ const SHADOW_PRIORITY = -10
 export { RewindController } from './controller.js'
 export { ArmedNotice, RewindButton, UserRewindActions, describe, retryTarget } from './components.js'
 export { FeedRegistry, SessionFeed, hidingCss, rewindRange, withdrawalStart } from './feed.js'
-export { createRetryAction, createUserNodeRenderer, officialRenderer } from './renderers.js'
+export { createRetryAction, createUserNodeRenderer, mirrorUserBefore, officialChain, officialRenderer, registerUserNodes } from './renderers.js'
 
 /** One `<style>` per Session holding its hiding rules. */
 function cssWriter(sessionId: string): (css: string) => void {
@@ -91,9 +94,7 @@ export async function apply(ctx: Context): Promise<void> {
     }
     const slots = c.slots as SlotsLike
     const UserNode = createUserNodeRenderer(slots, face, feeds)
-    for (const key of ['user', 'steering']) {
-      slots.inject(NODE_SLOT, () => slots.register({ name: NODE_SLOT, key, locale: 'chat', priority: SHADOW_PRIORITY }, UserNode))
-    }
+    registerUserNodes(slots, UserNode, SHADOW_PRIORITY)
     slots.inject('conversation.chat.assistant-actions', () => slots.register({
       name: 'conversation.chat.assistant-actions', id: 'message-rewind.retry', order: 90,
     }, createRetryAction(face)))
