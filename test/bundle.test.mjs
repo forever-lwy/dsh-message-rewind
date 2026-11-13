@@ -16,7 +16,7 @@ function officialLayers() {
   return ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'].flatMap(name => {
     const path = require.resolve(name + '/package.json')
     const pkg = JSON.parse(readFileSync(path, 'utf8'))
-    assert.equal(pkg.version, '0.2.2-rc.1')
+    assert.equal(pkg.version, '0.2.2-rc.3')
     return [].concat(pkg.dsh.bundle.patch).map(patch => loadOverlayPatches('message-rewind-test', resolve(dirname(path), patch)))
   })
 }
