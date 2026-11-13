@@ -6,11 +6,7 @@ export type Translate = (key: string) => string;
 export interface RewindFace {
     controller: RewindController;
     t: Translate;
-    Tooltip?: ((props: {
-        label: string;
-        side?: string;
-        children: ReactNode;
-    }) => ReactNode) | undefined;
+    Tooltip?: typeof import('@deepseek-ai/dsh-client-ui-primitives').Tooltip | undefined;
     RetryIcon?: (() => ReactNode) | undefined;
 }
 export declare function UndoIcon(): import("react").JSX.Element;
